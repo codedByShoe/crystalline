@@ -9,6 +9,17 @@ end
 
 describe Crystalline::BrokenSourceFixer do
   it_fixes <<-CRYSTAL, <<-CRYSTAL
+    value =
+    CRYSTAL
+    value = nil
+    CRYSTAL
+
+  it "does not rewrite comparison operators" do
+    source = "left ==\nleft !=\nleft <=\nleft >=\n"
+    Crystalline::BrokenSourceFixer.fix(source).should eq(source.chomp)
+  end
+
+  it_fixes <<-CRYSTAL, <<-CRYSTAL
     if foo
     CRYSTAL
     if foo; end

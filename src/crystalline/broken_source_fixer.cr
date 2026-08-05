@@ -15,7 +15,7 @@ class Crystalline::BrokenSourceFixer
     # or when we find a wrong indentation.
     stack = [] of LineInfo
 
-    lines = source.lines
+    lines = source.lines.map { |line| fix_dangling_assignment(line) }
     lines.each_with_index do |line, line_index|
       next if line.blank?
 
@@ -82,6 +82,17 @@ class Crystalline::BrokenSourceFixer
       non_whitespace_char_index // 2
     else
       0
+    end
+  end
+
+  private def self.fix_dangling_assignment(line : String) : String
+    # While typing an assignment, `name =` is a common transient state. It is
+    # safe to use `nil` as a placeholder because error-tolerant semantic analysis
+    # can continue even when the eventual value is expected to have another type.
+    if line.matches?(/[^=!<>~]=\s*$/)
+      "#{line} nil"
+    else
+      line
     end
   end
 

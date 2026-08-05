@@ -92,6 +92,16 @@ describe Crystalline::CompletionContext do
     context.rewritten_line.should eq("")
   end
 
+  it "excludes both sigils from a class-variable replacement" do
+    context = Crystalline::CompletionContext.detect("@@cou", 5, nil).not_nil!
+
+    context.trigger_character.should eq("@")
+    context.replace_start.should eq(2)
+    context.replace_end.should eq(5)
+    context.fragment.should eq("cou")
+    context.rewritten_line.should eq("")
+  end
+
   it "handles explicit dot triggers" do
     context = Crystalline::CompletionContext.detect("foo.", 4, ".")
     context.should_not be_nil
@@ -102,5 +112,16 @@ describe Crystalline::CompletionContext do
     context.replace_start.should eq(4)
     context.replace_end.should eq(4)
     context.rewritten_line.should eq("foo")
+  end
+
+  it "removes a partial local identifier while preserving its replacement range" do
+    context = Crystalline::CompletionContext.detect("  local_val", 11, nil).not_nil!
+
+    context.trigger_character.should be_nil
+    context.analysis_column.should eq(3)
+    context.replace_start.should eq(2)
+    context.replace_end.should eq(11)
+    context.fragment.should eq("local_val")
+    context.rewritten_line.should eq("  nil")
   end
 end

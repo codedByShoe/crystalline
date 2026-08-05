@@ -518,6 +518,7 @@ class Crystalline::Workspace
       server,
       file_uri,
       in_memory: true,
+      ignore_cached_result: true,
       discard_nil_cached_result: true,
       wants_doc: true,
       text_overrides: text_overrides,
@@ -525,9 +526,12 @@ class Crystalline::Workspace
       ignore_diagnostics: true,
       do_not_cache_result: true
     )
-    return unless result
+    unless result
+      LSP::Log.debug { "Completion compilation returned no result for #{file_uri}" }
+      return
+    end
 
-    nodes, _ = Analysis.nodes_at_cursor(result, location)
+    nodes, cursor_context = Analysis.nodes_at_cursor(result, location)
     nodes.last?.try do |n|
       completion_items = [] of LSP::CompletionItem
 
@@ -547,6 +551,9 @@ class Crystalline::Workspace
         # We are looking for methods…
         if node_type.responds_to? :defs
           Analysis.all_defs(node_type.not_nil!).each { |def_name, definition, owner_type, nesting|
+            next if definition.visibility.private?
+            next if definition.doc.try(&.includes?(":nodoc:"))
+
             owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
             owner_prefix ||= ""
             documentation = (owner_prefix + (definition.doc || ""))
@@ -573,7 +580,10 @@ class Crystalline::Workspace
             )
           }
 
-          Analysis.all_macros(n.type).each { |macro_name, macro_def, owner_type, nesting|
+          Analysis.all_macros(node_type.not_nil!).each { |macro_name, macro_def, owner_type, nesting|
+            next if macro_def.visibility.private?
+            next if macro_def.doc.try(&.includes?(":nodoc:"))
+
             owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
             owner_prefix ||= ""
             documentation = (owner_prefix + (macro_def.doc || ""))
@@ -608,15 +618,16 @@ class Crystalline::Workspace
           node_type ||= Utils.resolve_path(n, nodes)
         end
 
-        if node_type.is_a? Crystal::MetaclassType
-          node_type = node_type.instance_type
+        node_type = node_type.instance_type if node_type.is_a? Crystal::MetaclassType
 
+        if node_type.is_a? Crystal::ModuleType
           Analysis.all_submodules(result, node_type).uniq(&.to_s).each { |type|
             type_string = type.to_s
+            insertion = type_string.lchop("#{node_type}::")
 
             text_edit = LSP::TextEdit.new(
               range: range,
-              new_text: type_string.lchop(node_type.to_s).lchop(trigger_character || ':'),
+              new_text: insertion,
             )
 
             completion_items << LSP::CompletionItem.new(
@@ -634,15 +645,33 @@ class Crystalline::Workspace
         end
       else
         # Context autocompletion.
-        context = Analysis.context_at(result, location)
+        context = Analysis.context_at(result, location) || Hash(String, Crystal::Type).new
         if trigger_character == "@"
-          context.try &.select!(&.starts_with?("@"))
+          if self_type = cursor_context["self"]?.try(&.[0])
+            variables = if completion_context.replace_start - completion_context.analysis_column == 2
+                          owner_type = self_type.is_a?(Crystal::MetaclassType) ? self_type.instance_type : self_type
+                          owner_type.all_class_vars
+                        else
+                          self_type.all_instance_vars
+                        end
+            variables.each do |name, variable|
+              if variable_type = variable.type?
+                context[name] = variable_type
+              end
+            end
+          end
+          context.select!(&.starts_with?("@"))
         end
-        context.try &.each { |name, type|
+        context.each { |name, type|
           label = "#{name} : #{type}"
+          insertion = if trigger_character == "@"
+                        name.lchop(name.starts_with?("@@") ? "@@" : "@")
+                      else
+                        name
+                      end
           text_edit = LSP::TextEdit.new(
             range: range,
-            new_text: name.lchop(trigger_character || ""),
+            new_text: insertion,
           )
           completion_items << LSP::CompletionItem.new(
             label: label,
@@ -656,6 +685,18 @@ class Crystalline::Workspace
             },
           )
         }
+      end
+
+      fragment = completion_context.fragment
+      unless fragment.empty?
+        completion_items.select! do |item|
+          candidate = item.text_edit.try(&.new_text) || item.filter_text || item.insert_text || item.label
+          candidate.starts_with?(fragment)
+        end
+      end
+
+      completion_items.uniq! do |item|
+        {item.label, item.detail, item.kind, item.text_edit.try(&.new_text)}
       end
 
       selected_element_index = nil
@@ -679,7 +720,8 @@ class Crystalline::Workspace
         items: completion_items,
       )
     end
-  rescue
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to complete at #{file_uri}:#{position.line + 1}:#{position.character + 1}" }
     nil
   end
 
