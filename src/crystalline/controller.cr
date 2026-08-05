@@ -81,6 +81,11 @@ class Crystalline::Controller
         return nil unless @pending_requests.includes? message.id
         workspace.document_highlights(@server, message.params)
       end
+    when LSP::RenameRequest
+      @compiler_lock.synchronize do
+        return nil unless @pending_requests.includes? message.id
+        workspace.rename(@server, message.params)
+      end
     when LSP::SignatureHelpRequest
       @compiler_lock.synchronize do
         return nil unless @pending_requests.includes? message.id
@@ -109,6 +114,10 @@ class Crystalline::Controller
     when LSP::FoldingRangeRequest
       @documents_lock.synchronize do
         workspace.folding_ranges(message.params)
+      end
+    when LSP::WorkspaceSymbolRequest
+      @documents_lock.synchronize do
+        workspace.workspace_symbols(message.params)
       end
     else
       nil
