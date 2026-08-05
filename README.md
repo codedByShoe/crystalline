@@ -9,6 +9,18 @@
 
 <hr/>
 
+> [!WARNING]
+>
+> ### Personal Fork
+>
+> This is my personal fork of crystalline. As the original maintainer noted below, the project is currently being passively maintained.
+> While I also have limited free time, I'd like to explore a proof of concept demonstrating that Crystal can have excellent developer tooling.
+> To be totally transparent, much of this proof of concept is being created by AI agents.
+> Use at your own risk.
+> 
+
+<hr/>
+
 **`Crystalline` is an implementation of the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/)
 written in and for the [Crystal Language](https://crystal-lang.org/). It aims to
