@@ -620,6 +620,18 @@ class Crystalline::Workspace
     }
   end
 
+  def folding_ranges(params : LSP::FoldingRangeParams)
+    @opened_documents[params.text_document.uri]?.try { |text_document|
+      parser = Crystal::Parser.new(fix_source(text_document.contents))
+      parser.filename = URI.parse(params.text_document.uri).decoded_path
+      parser.wants_doc = false
+
+      Analysis::FoldingRangeVisitor.new.tap { |visitor|
+        parser.parse.accept(visitor)
+      }.ranges
+    }
+  end
+
   private def fix_source(source : String) : String
     # LSP::Log.info { "Fixing source: #{source}" }
     Crystal::Parser.parse(source)

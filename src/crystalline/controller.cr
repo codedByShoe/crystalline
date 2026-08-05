@@ -96,6 +96,10 @@ class Crystalline::Controller
           }
         end
       end
+    when LSP::FoldingRangeRequest
+      @documents_lock.synchronize do
+        workspace.folding_ranges(message.params)
+      end
     else
       nil
     end
