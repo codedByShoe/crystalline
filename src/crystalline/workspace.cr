@@ -399,6 +399,43 @@ class Crystalline::Workspace
     end
   end
 
+  def rename(server : LSP::Server, params : LSP::RenameParams)
+    return nil if params.new_name.empty?
+
+    reference_params = LSP::ReferenceParams.new(
+      text_document: params.text_document,
+      position: params.position,
+      context: LSP::ReferenceContext.new(include_declaration: true),
+    )
+
+    references(server, reference_params).try do |locations|
+      next nil if locations.empty?
+
+      edits_by_uri = locations.group_by(&.uri).transform_values do |document_locations|
+        document_locations.map do |location|
+          LSP::TextEdit.new(range: location.range, new_text: params.new_name)
+        end
+      end
+
+      supports_document_changes = server.client_capabilities.workspace.try(&.workspace_edit).try(&.document_changes)
+      unless supports_document_changes
+        next LSP::WorkspaceEdit.new(changes: edits_by_uri, document_changes: nil)
+      end
+
+      document_changes = edits_by_uri.map do |uri, edits|
+        LSP::TextDocumentEdit.new(
+          text_document: LSP::VersionedTextDocumentIdentifier.new(uri: uri, version: nil),
+          edits: edits,
+        )
+      end
+
+      LSP::WorkspaceEdit.new(
+        changes: {} of String => Array(LSP::TextEdit),
+        document_changes: document_changes,
+      )
+    end
+  end
+
   def signature_help(server : LSP::Server, file_uri : URI, position : LSP::Position)
     result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
     location = Crystal::Location.new(
@@ -668,6 +705,39 @@ class Crystalline::Workspace
         parser.parse.accept(visitor)
       }.ranges
     }
+  end
+
+  def workspace_symbols(params : LSP::WorkspaceSymbolParams)
+    query = params.query.downcase
+    files = @projects.flat_map do |project|
+      root = project.root_uri.decoded_path
+      Dir.glob(Path[root, "**", "*.cr"].to_s).reject do |path|
+        relative_parts = Path[path].relative_to(root).parts
+        relative_parts.includes?("lib") || relative_parts.includes?(".git")
+      end
+    end
+
+    # A workspace-less server is still useful in editors that open individual
+    # files without sending a root URI.
+    if files.empty?
+      files.concat(@opened_documents.keys.map { |uri| URI.parse(uri).decoded_path })
+    end
+
+    files.uniq!.flat_map do |path|
+      uri = URI.parse("file://#{Path[path].normalize}").to_s
+      source = @opened_documents[uri]?.try(&.contents) || File.read(path)
+      parser = Crystal::Parser.new(fix_source(source))
+      parser.filename = Path[path].normalize.to_s
+      parser.wants_doc = false
+
+      Analysis::DocumentSymbolsVisitor.new.tap { |visitor|
+        parser.parse.accept(visitor)
+      }.symbols.flat_map(&.to_symbol_information_array(uri))
+    rescue e
+      LSP::Log.debug(exception: e) { "Unable to collect symbols from #{path}: #{e.message}" }
+      [] of LSP::SymbolInformation
+    end.select { |symbol| query.empty? || symbol.name.downcase.includes?(query) }
+      .sort_by { |symbol| {symbol.name.downcase, symbol.location.uri, symbol.location.range.start.line} }
   end
 
   private def fix_source(source : String) : String

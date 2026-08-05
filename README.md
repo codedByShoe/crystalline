@@ -384,6 +384,15 @@ Find semantically resolved uses of methods, types, constants, and variables
 across the entry point's dependency tree, or highlight them in the current
 document.
 
+#### Rename
+
+Rename semantically resolved methods, types, constants, and variables across
+the entry point's dependency tree.
+
+#### Workspace symbols
+
+Search declarations across the Crystal source files in the current project.
+
 #### Hover information
 
 Hovering should display (when possible) either a variable type, a function
