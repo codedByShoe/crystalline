@@ -304,6 +304,10 @@ targets:
 With the configuration above, every file required by `src/entry.cr` will use
 `src/entry.cr` as the entry point.
 
+Project-wide references can only include files in that entry point's resolved
+dependency tree. Ensure the entry point requires every file whose references
+you expect Crystalline to find.
+
 If this `shard.yml` entry is not present, or if the file is not part of the main
 dependency tree then `crystalline` will use the file itself as the entry point.
 
@@ -373,6 +377,12 @@ A whole document or a text selection.
 
 By clicking on a symbol with the Cmd or Ctrl key pressed (editor/platform
 dependent).
+
+#### Find references and document highlights
+
+Find semantically resolved uses of methods, types, constants, and variables
+across the entry point's dependency tree, or highlight them in the current
+document.
 
 #### Hover information
 

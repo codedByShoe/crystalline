@@ -151,6 +151,19 @@ module Crystalline::Analysis
           Utils.locations_from_path(node, nodes)
         elsif node.is_a? Crystal::Union
           Utils.locations_from_union(node, nodes)
+        elsif node.is_a?(Crystal::Def) || node.is_a?(Crystal::Macro)
+          if (start_location = node.location)
+            end_location = node.end_location || start_location
+            [{start_location, end_location}]
+          end
+        elsif node.is_a?(Crystal::ClassDef) || node.is_a?(Crystal::ModuleDef) || node.is_a?(Crystal::AnnotationDef) || node.is_a?(Crystal::EnumDef) || node.is_a?(Crystal::LibDef)
+          resolved_type = node.resolved_type rescue nil
+          resolved_type.try &.locations.try &.map { |type_location| {type_location, type_location} }
+        elsif node.is_a? Crystal::Arg
+          if (definition = context[node.name]?)
+            _, argument_location = definition
+            [{argument_location, argument_location}] if argument_location
+          end
         elsif node.is_a? Crystal::Var
           if (definition = context[node.to_s]?)
             _, location = definition
@@ -163,7 +176,9 @@ module Crystalline::Analysis
             end
           end
         elsif node.is_a? Crystal::ClassVar
-          if (cvar = context["self"]?.try &.[0].try &.all_class_vars[node.name]?) # lookup_raw_class_var? node.name
+          cvar = node.var rescue nil
+          cvar ||= context["self"]?.try &.[0].try &.all_class_vars[node.name]? # lookup_raw_class_var? node.name
+          if cvar
             if (location = cvar.location)
               [{location, location}]
             end
@@ -173,6 +188,15 @@ module Crystalline::Analysis
 
       Definitions.new(node: node, locations: locations)
     }
+  end
+
+  # Return all references to the symbol at *location*.
+  def self.references_at_cursor(result : Crystal::Compiler::Result, location : Crystal::Location, *, include_declaration = false) : Array(LSP::Location)?
+    definitions_at_cursor(result, location).try do |definitions|
+      definitions.locations.try do |target_locations|
+        ReferencesVisitor.new(definitions.node, target_locations, include_declaration).process(result)
+      end
+    end
   end
 
   def self.all_defs(type, *, accumulator = [] of {String, Crystal::Def, Crystal::Type, Int32}, nesting = 0)
