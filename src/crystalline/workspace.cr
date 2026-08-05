@@ -361,6 +361,62 @@ class Crystalline::Workspace
     nil
   end
 
+  def signature_help(server : LSP::Server, file_uri : URI, position : LSP::Position)
+    result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
+    location = Crystal::Location.new(
+      file_uri.decoded_path,
+      line_number: position.line + 1,
+      column_number: position.character + 1
+    )
+    result.try { |r|
+      Analysis.nodes_at_cursor(r, location)
+    }.try do |nodes, _context|
+      call = nodes.reverse_each.find(&.is_a?(Crystal::Call)).as?(Crystal::Call)
+      call.try do |c|
+        target_defs = c.target_defs
+        next nil unless target_defs && target_defs.size > 0
+
+        # `target_defs` only holds the overload(s) actually matched by the call as
+        # currently typed. Look up every def sharing the same name on the resolved
+        # owner too, so signature help can list sibling overloads (e.g. while the
+        # user is still choosing which one to use), not just the matched one.
+        owner = target_defs.first.owner
+        defs = owner.defs.try(&.[c.name]?).try(&.map(&.def)) || target_defs
+
+        # The index of the argument the cursor is currently in, based on how many
+        # of the call's already-parsed arguments start before the cursor location.
+        active_parameter = c.args.index { |arg|
+          arg_location = arg.location
+          arg_location.nil? || location < arg_location
+        } || c.args.size
+
+        signatures = defs.map { |d|
+          LSP::SignatureInformation.new(
+            label: Utils.format_def(d, short: true),
+            documentation: d.doc.try { |doc|
+              LSP::MarkupContent.new(kind: LSP::MarkupKind::MarkDown, value: doc)
+            },
+            parameters: d.args.map { |arg| LSP::ParameterInformation.new(label: arg.to_s) },
+          )
+        }
+
+        # Prefer whichever overload the compiler actually matched for this call;
+        # fall back to the first overload whose arity can fit the active parameter.
+        active_signature = defs.index { |d| target_defs.includes?(d) } ||
+                            defs.index { |d| d.args.size > active_parameter || d.splat_index || d.double_splat } ||
+                            0
+
+        LSP::SignatureHelp.new(
+          signatures: signatures,
+          active_signature: active_signature,
+          active_parameter: active_parameter,
+        )
+      end
+    end
+  rescue
+    nil
+  end
+
   def completion(server : LSP::Server, file_uri : URI, position : LSP::Position, trigger_character : String?)
     text_document = @opened_documents[file_uri.to_s]?
     return unless text_document
