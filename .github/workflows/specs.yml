@@ -9,12 +9,20 @@ on:
 jobs:
   specs:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crystal: [1.20.0, 1.21.0]
     steps:
       - name: Download source
         uses: actions/checkout@v6.0.2
       - name: Install Crystal
         uses: crystal-lang/install-crystal@v1.9.2
+        with:
+          crystal: ${{ matrix.crystal }}
       - name: Install dependencies
         run: shards install --ignore-crystal-version
+      - name: Build executable
+        run: shards build crystalline --no-debug -Dpreview_mt
       - name: Run tests
         run: crystal spec

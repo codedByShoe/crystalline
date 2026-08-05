@@ -1,3 +1,4 @@
+require "./crystal_compat"
 require "llvm/lib_llvm"
 require "compiler/crystal/annotatable"
 require "compiler/crystal/tools/dependencies"
