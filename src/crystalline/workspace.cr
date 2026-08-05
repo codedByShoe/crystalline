@@ -361,6 +361,44 @@ class Crystalline::Workspace
     nil
   end
 
+  def references(server : LSP::Server, params : LSP::ReferenceParams)
+    file_uri = URI.parse(params.text_document.uri)
+    result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
+    location = Crystal::Location.new(
+      file_uri.decoded_path,
+      line_number: params.position.line + 1,
+      column_number: params.position.character + 1
+    )
+    result.try do |compiled|
+      Analysis.references_at_cursor(
+        compiled,
+        location,
+        include_declaration: params.context.include_declaration,
+      )
+    end
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to find references: #{e.message}" }
+    nil
+  end
+
+  def document_highlights(server : LSP::Server, params : LSP::DocumentHighlightParams)
+    reference_params = LSP::ReferenceParams.new(
+      text_document: params.text_document,
+      position: params.position,
+      context: LSP::ReferenceContext.new(include_declaration: true),
+    )
+
+    references(server, reference_params).try do |locations|
+      locations.compact_map do |location|
+        next unless location.uri == params.text_document.uri
+        LSP::DocumentHighlight.new(
+          range: location.range,
+          kind: LSP::DocumentHighlightKind::Text,
+        )
+      end
+    end
+  end
+
   def signature_help(server : LSP::Server, file_uri : URI, position : LSP::Position)
     result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
     location = Crystal::Location.new(

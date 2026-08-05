@@ -71,6 +71,16 @@ class Crystalline::Controller
         file_uri = URI.parse message.params.text_document.uri
         workspace.definitions(@server, file_uri, message.params.position)
       end
+    when LSP::ReferencesRequest
+      @compiler_lock.synchronize do
+        return nil unless @pending_requests.includes? message.id
+        workspace.references(@server, message.params)
+      end
+    when LSP::DocumentHighlightRequest
+      @compiler_lock.synchronize do
+        return nil unless @pending_requests.includes? message.id
+        workspace.document_highlights(@server, message.params)
+      end
     when LSP::SignatureHelpRequest
       @compiler_lock.synchronize do
         return nil unless @pending_requests.includes? message.id

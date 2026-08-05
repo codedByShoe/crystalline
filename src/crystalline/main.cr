@@ -16,6 +16,8 @@ module Crystalline
     ),
     hover_provider: true,
     definition_provider: true,
+    references_provider: true,
+    document_highlight_provider: true,
     document_symbol_provider: true,
     folding_range_provider: true,
     signature_help_provider: LSP::SignatureHelpOptions.new(
