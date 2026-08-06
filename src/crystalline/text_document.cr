@@ -1,15 +1,13 @@
-require "priority-queue"
 require "uri"
 require "./project"
 
 class Crystalline::TextDocument
   getter uri : URI
   @inner_contents : Array(String) = [] of String
-  getter! version : Int32
-  @pending_changes : Priority::Queue({String, LSP::Range}) = Priority::Queue({String, LSP::Range}).new
+  getter version : Int32?
   getter? project : Project?
 
-  def initialize(@uri, @project, contents : String)
+  def initialize(@uri, @project, contents : String, @version : Int32? = nil)
     self.contents = contents
   end
 
@@ -41,37 +39,31 @@ class Crystalline::TextDocument
     content_changes.each { |change|
       update_contents(*change, version: version)
     }
-
-    # Check for pending changes
-    loop do
-      break unless @pending_changes.first?.try(&.priority.== self.version + 1)
-      item = @pending_changes.shift
-      partial_update(item.value[0], item.value[1], version: item.priority.to_i32)
-    end
   end
 
   private def update_contents(contents : String, range : LSP::Range? = nil, version : Int32? = nil)
     if range
       # Incremental update
-      if version && check_version(version)
-        # Version is up-to-date
-        partial_update(contents, range, version)
-      elsif version
-        # Some updates are missing
-        @pending_changes.push version, {contents, range}
-      else
-        # No version field.
-        partial_update(contents, range, version)
-      end
+      partial_update(contents, range, version) unless superseded?(version)
     else
       # Full update
       full_update(contents, version)
     end
   end
 
-  private def check_version(version : Int32)
-    @version ||= version
-    @version == version - 1 || @version == version
+  # The protocol only promises that document versions increase, never that they
+  # increase one at a time: neovim numbers its changes with the buffer's
+  # changedtick, so `didOpen` at version 0 is routinely followed by a change at
+  # version 4. Requiring consecutive versions drops that change - and with it
+  # every later one, since the document version then never advances again -
+  # leaving the server working from the text as it was when the file was opened.
+  #
+  # Notifications arrive in order on a single connection, so the only version
+  # worth refusing is one that moves backwards.
+  private def superseded?(version : Int32?) : Bool
+    current = @version
+    return false unless current && version
+    version < current
   end
 
   private def partial_update(contents : String, range : LSP::Range, version : Int32? = nil)
@@ -85,7 +77,6 @@ class Crystalline::TextDocument
   end
 
   private def full_update(contents : String, version : Int32? = nil)
-    @pending_changes.clear
     self.contents = contents
     @version = version if version
   end

@@ -7,6 +7,64 @@ private def doc(contents : String)
 end
 
 describe Crystalline::TextDocument do
+  it "retains the version supplied when a document is opened" do
+    document = Crystalline::TextDocument.new(
+      URI.parse("file:///tmp/versioned.cr"),
+      nil,
+      "value = 1\n",
+      12,
+    )
+
+    document.version.should eq(12)
+  end
+
+  it "applies a change whose version is not the next one" do
+    # Exactly what neovim sends: `didOpen` at version 0, then a change stamped
+    # with the buffer's changedtick. Refusing the gap used to freeze the
+    # document at its opened contents for the rest of the session.
+    document = Crystalline::TextDocument.new(URI.parse("file:///tmp/gap.cr"), nil, "Kemal.run\n", 0)
+
+    document.update_contents([
+      {"\nname = \"something\"\nname.\n", LSP::Range.new(
+        start: LSP::Position.new(line: 0, character: 9),
+        end: LSP::Position.new(line: 1, character: 0),
+      )},
+    ], version: 4)
+
+    document.contents.should eq("Kemal.run\nname = \"something\"\nname.\n")
+    document.version.should eq(4)
+  end
+
+  it "keeps applying changes after a version gap" do
+    document = Crystalline::TextDocument.new(URI.parse("file:///tmp/gap.cr"), nil, "a\n", 0)
+
+    [{7, "b"}, {9, "c"}, {10, "d"}].each do |(version, text)|
+      document.update_contents([
+        {text, LSP::Range.new(
+          start: LSP::Position.new(line: 0, character: 0),
+          end: LSP::Position.new(line: 0, character: 1),
+        )},
+      ], version: version)
+    end
+
+    document.contents.should eq("d\n")
+    document.version.should eq(10)
+  end
+
+  it "ignores a change that moves the version backwards" do
+    document = Crystalline::TextDocument.new(URI.parse("file:///tmp/stale.cr"), nil, "current\n", 8)
+
+    document.update_contents([
+      {"stale", LSP::Range.new(
+        start: LSP::Position.new(line: 0, character: 0),
+        end: LSP::Position.new(line: 0, character: 7),
+      )},
+    ], version: 3)
+
+    document.contents.should eq("current\n")
+    document.version.should eq(8)
+  end
+
   it "computes EOF position for empty contents" do
     document = doc("")
 

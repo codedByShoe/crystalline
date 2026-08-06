@@ -85,6 +85,16 @@ class Crystalline::CompletionContext
     @line[0...@prefix_end]
   end
 
+  # The typed part of the fragment, meaning what precedes the cursor. The
+  # fragment itself spans the whole identifier under the cursor because that is
+  # what an accepted completion replaces; filtering on it would match candidates
+  # against text the user has not typed - in `value.|strip` only methods
+  # starting with "strip" would survive.
+  def filter_fragment : String
+    return "" if @cursor <= @replace_start
+    @line[@replace_start...@cursor]? || ""
+  end
+
   def completion_range(line_number : Int32) : LSP::Range
     LSP::Range.new(
       start: LSP::Position.new(line: line_number, character: @replace_start),

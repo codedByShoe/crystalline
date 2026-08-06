@@ -16,7 +16,7 @@ class Crystalline::Project
       main_path = Path[root_uri.decoded_path, relative_main]
       # Add the entry point as a dependency to itself.
       dependencies << main_path.to_s
-      URI.parse("file://#{main_path}")
+      URI.parse(Utils.file_uri(main_path))
     end
   rescue e
     nil
@@ -58,7 +58,7 @@ class Crystalline::Project
 
           if is_directory && has_shard_yml && is_not_lib
             normalized_path = Path[workspace_root_uri.decoded_path, path].normalize
-            acc << Project.new(URI.parse("file://#{normalized_path}"))
+            acc << Project.new(URI.parse(Utils.file_uri(normalized_path)))
           else
             acc
           end

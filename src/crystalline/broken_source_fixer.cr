@@ -69,7 +69,15 @@ class Crystalline::BrokenSourceFixer
       lines[-1] = "#{lines[-1]}; #{closing_keyword(line_info)}"
     end
 
-    lines.join("\n")
+    # `String#lines` drops the trailing terminator, so the naive `join` returns a
+    # source with one line less than the original whenever the document ends with
+    # a newline. Callers map cursor positions onto the fixed source, so the line
+    # count has to be preserved.
+    separator = source.includes?("\r\n") ? "\r\n" : "\n"
+    String.build do |str|
+      lines.join(str, separator)
+      str << separator if source.ends_with?('\n')
+    end
   end
 
   private def self.line_indent(line : String) : Int32?
