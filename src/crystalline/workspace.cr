@@ -14,6 +14,11 @@ class Crystalline::Workspace
     types : Array({String, LSP::CompletionItemKind}),
     symbols : Array(LSP::DocumentSymbol)
 
+  # A successful analysis, and the target it was produced from.
+  record StoredAnalysis,
+    target : String,
+    result : Crystal::Compiler::Result
+
   # The previous compilation results, indexed by compilation entry point.
   @result_cache : Crystalline::ResultCache = Crystalline::ResultCache.new
   # Completion rewrites remove the fragment after a receiver, so `value.`,
@@ -28,6 +33,13 @@ class Crystalline::Workspace
   @receiver_items_cache = {} of String => Array(LSP::CompletionItem)
   # When the dependencies of each project were last recomputed.
   @dependency_attempts = {} of String => Time::Instant
+  # The most recent successful analysis of each project. What a type responds to
+  # is answered from here rather than from an analysis of the buffer being typed
+  # in, which costs a whole project build per keystroke. A shard without an entry
+  # point has no project-wide analysis to speak of, so this holds whichever file
+  # was compiled last - a partial view that is still worth asking.
+  @analyses = {} of String => StoredAnalysis
+  @analyses_lock = Mutex.new
   # Syntax-only completion answers are built by parsing the whole project. Keep
   # the parse of every file around, keyed by a stamp of its contents, so typing
   # does not re-read and re-parse the project on every keystroke.
@@ -351,6 +363,7 @@ class Crystalline::Workspace
         end
 
         if result
+          store_analysis(project, target_string, result)
           if project.try(&.entry_point?)
             # Store the project dependencies.
             project.not_nil!.dependencies = result.program.requires
@@ -684,8 +697,17 @@ class Crystalline::Workspace
     end
 
     if trigger_character == "."
-      if syntax_result = syntax_method_completion(file_uri, contents, position, completion_context)
-        return syntax_result unless syntax_result.items.empty?
+      # What the syntax index can see is what the buffer says right now, which is
+      # not much: only the methods spelled out in project source. It is merged
+      # into the analysis rather than answered from on its own, because returning
+      # it alone hides everything a type inherits or generates - `Type.` used to
+      # come back with the one or two methods written next to it.
+      syntax_items = syntax_method_items(file_uri, contents, position, completion_context)
+      if analysis_result = analysis_method_completion(file_uri, contents, position, completion_context, syntax_items)
+        return analysis_result unless analysis_result.items.empty?
+      end
+      if syntax_items && !syntax_items.empty?
+        return finalize_completion(syntax_items, completion_context, position.line)
       end
     end
 
@@ -786,65 +808,7 @@ class Crystalline::Workspace
 
         # We are looking for methods…
         if node_type.responds_to? :defs
-          Analysis.all_defs(node_type.not_nil!).each { |def_name, definition, owner_type, nesting|
-            next if definition.visibility.private?
-            next if definition.doc.try(&.includes?(":nodoc:"))
-
-            owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
-            owner_prefix ||= ""
-            documentation = (owner_prefix + (definition.doc || ""))
-
-            text_edit = LSP::TextEdit.new(
-              range: range,
-              new_text: def_name,
-            )
-
-            completion_items << LSP::CompletionItem.new(
-              label: Utils.format_def(definition, short: true),
-              insert_text: def_name,
-              kind: LSP::CompletionItemKind::Function,
-              filter_text: def_name,
-              detail: Utils.format_def(definition),
-              text_edit: text_edit,
-              sort_text: (nesting + 1).chr.to_s + def_name,
-              documentation: documentation.try { |doc|
-                LSP::MarkupContent.new(
-                  kind: LSP::MarkupKind::MarkDown,
-                  value: doc,
-                )
-              },
-            )
-          }
-
-          Analysis.all_macros(node_type.not_nil!).each { |macro_name, macro_def, owner_type, nesting|
-            next if macro_def.visibility.private?
-            next if macro_def.doc.try(&.includes?(":nodoc:"))
-
-            owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
-            owner_prefix ||= ""
-            documentation = (owner_prefix + (macro_def.doc || ""))
-
-            text_edit = LSP::TextEdit.new(
-              range: range,
-              new_text: macro_name,
-            )
-
-            completion_items << LSP::CompletionItem.new(
-              label: Utils.format_def(macro_def, short: true),
-              insert_text: macro_name,
-              kind: LSP::CompletionItemKind::Method,
-              filter_text: macro_name,
-              detail: Utils.format_def(macro_def),
-              text_edit: text_edit,
-              sort_text: (nesting + 1).chr.to_s + macro_name,
-              documentation: documentation.try { |doc|
-                LSP::MarkupContent.new(
-                  kind: LSP::MarkupKind::MarkDown,
-                  value: doc,
-                )
-              },
-            )
-          }
+          completion_items.concat(member_completion_items(node_type.not_nil!, n.type?, range))
         end
       when ":"
         # We are looking for module types…
@@ -939,6 +903,62 @@ class Crystalline::Workspace
   rescue e
     LSP::Log.debug(exception: e) { "Unable to complete at #{file_uri}:#{position.line + 1}:#{position.character + 1}" }
     nil
+  end
+
+  # Everything *type* responds to, as completion items. *receiver_type* is what
+  # the receiver itself resolved to, and only tells inherited members apart from
+  # the type's own.
+  private def member_completion_items(type : Crystal::Type, receiver_type : Crystal::Type?, range : LSP::Range) : Array(LSP::CompletionItem)
+    items = [] of LSP::CompletionItem
+
+    Analysis.all_defs(type).each do |def_name, definition, owner_type, nesting|
+      next if definition.visibility.private?
+      next if definition.doc.try(&.includes?(":nodoc:"))
+
+      items << member_completion_item(
+        def_name, definition, owner_type, receiver_type, nesting, range,
+        LSP::CompletionItemKind::Function,
+      )
+    end
+
+    Analysis.all_macros(type).each do |macro_name, macro_def, owner_type, nesting|
+      next if macro_def.visibility.private?
+      next if macro_def.doc.try(&.includes?(":nodoc:"))
+
+      items << member_completion_item(
+        macro_name, macro_def, owner_type, receiver_type, nesting, range,
+        LSP::CompletionItemKind::Method,
+      )
+    end
+
+    items
+  end
+
+  private def member_completion_item(
+    name : String,
+    definition : Crystal::Def | Crystal::Macro,
+    owner_type : Crystal::Type,
+    receiver_type : Crystal::Type?,
+    nesting : Int32,
+    range : LSP::Range,
+    kind : LSP::CompletionItemKind,
+  ) : LSP::CompletionItem
+    owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to?(:name) && owner_type != receiver_type
+    documentation = (owner_prefix || "") + (definition.doc || "")
+
+    LSP::CompletionItem.new(
+      label: Utils.format_def(definition, short: true),
+      insert_text: name,
+      kind: kind,
+      filter_text: name,
+      detail: Utils.format_def(definition),
+      text_edit: LSP::TextEdit.new(range: range, new_text: name),
+      sort_text: (nesting + 1).chr.to_s + name,
+      documentation: LSP::MarkupContent.new(
+        kind: LSP::MarkupKind::MarkDown,
+        value: documentation,
+      ),
+    )
   end
 
   private def store_completion_result(file_uri : URI, key : String, result : Crystal::Compiler::Result, location : Crystal::Location)
@@ -1206,7 +1226,152 @@ class Crystalline::Workspace
     end
   end
 
+  # A project that has never been analyzed has nothing to answer from, and a
+  # shard without an entry point only ever has a partial view - so this is keyed
+  # by project and always allowed to come back empty.
+  private def store_analysis(project : Project?, target : String, result : Crystal::Compiler::Result)
+    @analyses_lock.synchronize do
+      @analyses[analysis_key(project)] = StoredAnalysis.new(target, result)
+    end
+  end
+
+  private def stored_analysis(project : Project?) : StoredAnalysis?
+    @analyses_lock.synchronize { @analyses[analysis_key(project)]? }
+  end
+
+  # A server started on a single file has no project, and everything it opens
+  # shares the one analysis.
+  private def analysis_key(project : Project?) : String
+    project.try(&.root_uri.to_s) || ""
+  end
+
+  # Whether an analysis of the project *file_uri* belongs to is available.
+  def analysis_stored?(file_uri : URI) : Bool
+    !stored_analysis(Project.best_fit_for_file(@projects, file_uri)).nil?
+  end
+
+  # Answer a `.` on a receiver whose type is named in the source - `User.`,
+  # `News::Article.`, `User.new.`, or a local with a declared type - from the
+  # most recent analysis of the project.
+  #
+  # What a type responds to is a property of the type, not of the buffer the
+  # cursor sits in, so this needs no analysis of the text being typed: looking
+  # the name up in an analysis that already exists costs microseconds where
+  # building one costs about a second. The cost is that a type whose members are
+  # generated by a macro reflects the last build rather than the current buffer;
+  # members written by hand are covered by merging in *syntax_items*.
+  private def analysis_method_completion(
+    file_uri : URI,
+    contents : String,
+    position : LSP::Position,
+    context : CompletionContext,
+    syntax_items : Array(LSP::CompletionItem)?,
+  ) : LSP::CompletionList?
+    receiver = context.analysis_prefix.strip
+    path, class_method = receiver_type_path(receiver, contents, position)
+    return unless path
+
+    project = Project.best_fit_for_file(@projects, file_uri)
+    analysis = stored_analysis(project)
+    return unless analysis
+
+    # The buffer is mid-edit and does not parse - the receiver is followed by a
+    # period and nothing else - so the namespaces are read from the same repaired
+    # source the syntax index is built from.
+    repaired = contents.lines(chomp: false)
+    repaired[position.line] = context.rewritten_line if position.line < repaired.size
+    namespaces = enclosing_namespaces(file_uri, repaired.join, position)
+
+    instance_type = lookup_type_path(analysis.result.program, path, namespaces)
+    return unless instance_type
+    receiver_type = class_method ? instance_type.metaclass : instance_type
+
+    range = context.completion_range(position.line)
+    items = member_completion_items(receiver_type, receiver_type, range)
+    return if items.empty?
+
+    # Whatever the analysis already knows about wins: it carries documentation
+    # and a full signature. What it does not know about was written since the
+    # analysis was made, which is exactly what has to be merged in.
+    if syntax_items
+      known = items.compact_map(&.insert_text).to_set
+      items.concat(syntax_items.reject { |item| known.includes?(item.insert_text) })
+    end
+
+    finalize_completion(items, context, position.line)
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to complete #{file_uri} from a stored analysis" }
+    nil
+  end
+
+  # The type path a receiver names, and whether the receiver is that type itself
+  # rather than an instance of it.
+  private def receiver_type_path(receiver : String, contents : String, position : LSP::Position) : {String?, Bool}
+    if receiver.matches?(/\A[A-Z]\w*(?:::[A-Z]\w*)*\z/)
+      {receiver, true}
+    elsif match = receiver.match(/\A([A-Z]\w*(?:::[A-Z]\w*)*)\.new(?:\(.*\))?\z/)
+      {match[1], false}
+    elsif receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
+      {declared_type_for(receiver, contents, position), false}
+    else
+      {nil, false}
+    end
+  end
+
+  # Resolve *path* the way the compiler would at this point in the file: from
+  # the innermost enclosing namespace outwards, so `User` inside `module News`
+  # finds `News::User` before a top level `User`.
+  private def lookup_type_path(program : Crystal::Program, path : String, namespaces : Array(String)) : Crystal::Type?
+    names = path.split("::").reject(&.empty?)
+    return if names.empty?
+
+    namespaces.size.downto(0) do |depth|
+      container = if depth.zero?
+                    program
+                  else
+                    program.lookup_path(Crystal::Path.new(namespaces[0...depth])).as?(Crystal::Type)
+                  end
+      next unless container
+
+      found = container.lookup_path(Crystal::Path.new(names))
+      return found.instance_type if found.is_a?(Crystal::Type)
+    end
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to resolve #{path}" }
+    nil
+  end
+
+  # The types enclosing *position*, outermost first.
+  private def enclosing_namespaces(file_uri : URI, contents : String, position : LSP::Position) : Array(String)
+    path = Path[file_uri.decoded_path].normalize.to_s
+    # The same stamp the syntax index uses for a rewritten buffer, so the two
+    # share one parse of it rather than each paying for their own.
+    symbols = index_entry(path, contents, stamp: "current:#{contents.hash}").symbols
+    names = [] of String
+
+    while (symbol = symbols.find { |candidate|
+            (candidate.kind.class? || candidate.kind.module? || candidate.kind.enum?) &&
+            candidate.range.start.line <= position.line &&
+            position.line <= candidate.range.end.line
+          })
+      names << symbol.name
+      symbols = symbol.children || break
+    end
+
+    names
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to determine the namespaces enclosing #{file_uri}" }
+    [] of String
+  end
+
   private def syntax_method_completion(file_uri : URI, contents : String, position : LSP::Position, context : CompletionContext) : LSP::CompletionList?
+    items = syntax_method_items(file_uri, contents, position, context)
+    return if items.nil? || items.empty?
+
+    finalize_completion(items, context, position.line)
+  end
+
+  private def syntax_method_items(file_uri : URI, contents : String, position : LSP::Position, context : CompletionContext) : Array(LSP::CompletionItem)?
     receiver = context.analysis_prefix.strip
     owner = nil
     class_method = false
@@ -1251,9 +1416,8 @@ class Crystalline::Workspace
         ),
       )
     end
-    return if items.empty?
 
-    finalize_completion(items, context, position.line)
+    items
   end
 
   private def source_methods(file_uri : URI, current_source : String) : Array(Analysis::SourceMethod)
