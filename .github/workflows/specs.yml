@@ -12,10 +12,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 1.20.0 cannot build this project: compiling its own `src/log/dispatch.cr`
-        # with `-Dpreview_mt` fails with "type must be Nil, not (IO | Nil)". The
-        # static Linux build has always pinned 1.20.2, which does not have the bug.
-        crystal: [1.20.2, 1.21.0]
+        # Crystalline embeds the compiler it is built with, so the build version
+        # decides which language user code is analyzed against. There is no point
+        # testing against a version no release would ever be built with.
+        crystal: [1.21.0]
     steps:
       - name: Download source
         uses: actions/checkout@v6.0.2
