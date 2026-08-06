@@ -7,7 +7,7 @@ class Crystalline::Diagnostics
   forward_missing_to(@diagnostics)
 
   def append(diagnostic : LSP::Diagnostic)
-    key = "file://#{diagnostic.source}"
+    key = Utils.file_uri(diagnostic.source || "")
     self.init_value(key)
     @diagnostics[key] << diagnostic
   end
@@ -64,10 +64,14 @@ class Crystalline::Diagnostics
     }
   end
 
-  def publish(server : LSP::Server)
+  def publish(server : LSP::Server, *, versions : Hash(String, Int32)? = nil)
     @diagnostics.each { |key, value|
       server.try &.send(LSP::PublishDiagnosticsNotification.new(
-        params: LSP::PublishDiagnosticsParams.new(uri: key, diagnostics: value),
+        params: LSP::PublishDiagnosticsParams.new(
+          uri: key,
+          version: versions.try(&.[key]?),
+          diagnostics: value,
+        ),
       ))
     }
   end

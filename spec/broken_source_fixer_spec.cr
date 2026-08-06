@@ -9,6 +9,30 @@ end
 
 describe Crystalline::BrokenSourceFixer do
   it_fixes <<-CRYSTAL, <<-CRYSTAL
+    value =
+    CRYSTAL
+    value = nil
+    CRYSTAL
+
+  it "does not rewrite comparison operators" do
+    source = "left ==\nleft !=\nleft <=\nleft >=\n"
+    Crystalline::BrokenSourceFixer.fix(source).should eq(source)
+  end
+
+  it "keeps the line count of a source it cannot repair" do
+    # Cursor positions are mapped onto the fixed source, so a source that comes
+    # back a line short makes completion on the last line raise.
+    source = "x = 1\nfoo(\n\n"
+    fixed = Crystalline::BrokenSourceFixer.fix(source)
+    fixed.lines(chomp: false).size.should eq(source.lines(chomp: false).size)
+  end
+
+  it "preserves windows line endings" do
+    source = "class Foo\r\n  def bar\r\n"
+    Crystalline::BrokenSourceFixer.fix(source).should eq("class Foo\r\n  def bar; end; end\r\n")
+  end
+
+  it_fixes <<-CRYSTAL, <<-CRYSTAL
     if foo
     CRYSTAL
     if foo; end

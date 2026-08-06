@@ -12,6 +12,7 @@ class Crystalline::CompletionContext
   getter analysis_column : Int32
   getter replace_start : Int32
   getter replace_end : Int32
+  getter fragment : String
 
   def self.detect(line : String, cursor : Int32, trigger_character : String?) : self?
     new(line, cursor, trigger_character).detect
@@ -21,12 +22,16 @@ class Crystalline::CompletionContext
     @analysis_column = cursor
     @replace_start = cursor
     @replace_end = cursor
+    @prefix_end = cursor
+    @fragment = ""
+    @analysis_placeholder = false
   end
 
   def detect : self?
     fragment_start, fragment_end = identifier_fragment_bounds
     @replace_start = fragment_start
     @replace_end = fragment_end
+    @fragment = @line[fragment_start...fragment_end]
 
     tokens = tokens_for_line
     return if inside_comment?(tokens) || inside_delimited_literal?(tokens)
@@ -39,26 +44,36 @@ class Crystalline::CompletionContext
     when "."
       if operator = preceding_period(tokens, fragment_start)
         @analysis_column = operator.start_char
+        @prefix_end = operator.start_char
         @replace_start = operator.end_char
       end
     when ":"
       if operator = preceding_colon_colon(tokens, fragment_start)
         @analysis_column = operator.start_char
+        @prefix_end = operator.start_char
         @replace_start = operator.end_char
       end
     when "@"
       if sigil = current_sigiled_token(tokens)
         @analysis_column = sigil.start_char
+        @prefix_end = sigil.start_char
         @replace_start = sigil.start_char + sigil_prefix_size(sigil.type)
       elsif @cursor > 1 && @line[@cursor - 2, 2]? == "@@"
         @analysis_column = @cursor - 2
+        @prefix_end = @cursor - 2
         @replace_start = @cursor
       elsif @cursor > 0 && @line[@cursor - 1] == '@'
         @analysis_column = @cursor - 1
+        @prefix_end = @cursor - 1
         @replace_start = @cursor
       end
     else
-      @analysis_column = @cursor
+      # Remove the partial identifier before compiling while keeping the
+      # analysis location inside the enclosing scope. Crystal locations are
+      # one-based, whereas LSP positions and these string offsets are zero-based.
+      @prefix_end = fragment_start
+      @analysis_column = fragment_start + 1
+      @analysis_placeholder = true
     end
 
     self
@@ -67,7 +82,17 @@ class Crystalline::CompletionContext
   end
 
   def analysis_prefix : String
-    @line[0...@analysis_column]
+    @line[0...@prefix_end]
+  end
+
+  # The typed part of the fragment, meaning what precedes the cursor. The
+  # fragment itself spans the whole identifier under the cursor because that is
+  # what an accepted completion replaces; filtering on it would match candidates
+  # against text the user has not typed - in `value.|strip` only methods
+  # starting with "strip" would survive.
+  def filter_fragment : String
+    return "" if @cursor <= @replace_start
+    @line[@replace_start...@cursor]? || ""
   end
 
   def completion_range(line_number : Int32) : LSP::Range
@@ -91,7 +116,8 @@ class Crystalline::CompletionContext
     end
 
     suffix = suffix.try &.[right_offset...]?
-    analysis_prefix + (!truncate_line ? (suffix || "\n") : "\n")
+    placeholder = @analysis_placeholder ? "nil" : ""
+    analysis_prefix + placeholder + (!truncate_line ? (suffix || "\n") : "\n")
   end
 
   private def identifier_fragment_bounds

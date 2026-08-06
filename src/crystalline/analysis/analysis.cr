@@ -18,19 +18,19 @@ module Crystalline::Analysis
   end
 
   # Compile a target *file_uri*.
-  def self.compile(server : LSP::Server, file_uri : URI, *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String)
+  def self.compile(server : LSP::Server, file_uri : URI, *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String, diagnostic_versions : Hash(String, Int32)? = nil, diagnostics_current : Proc(Bool)? = nil)
     if file_uri.scheme == "file"
       file = File.new file_uri.decoded_path
       sources = [
         Crystal::Compiler::Source.new(file_uri.decoded_path, file.gets_to_end),
       ]
       file.close
-      self.compile(server, sources, lib_path: lib_path, file_overrides: file_overrides, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, top_level: top_level, compiler_flags: compiler_flags)
+      self.compile(server, sources, lib_path: lib_path, file_overrides: file_overrides, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags, diagnostic_versions: diagnostic_versions, diagnostics_current: diagnostics_current)
     end
   end
 
   # Compile an array of *sources*.
-  def self.compile(server : LSP::Server, sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String)
+  def self.compile(server : LSP::Server, sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String, diagnostic_versions : Hash(String, Int32)? = nil, diagnostics_current : Proc(Bool)? = nil)
     diagnostics = Diagnostics.new
     reply_channel = Channel(Crystal::Compiler::Result | Exception).new
 
@@ -100,7 +100,9 @@ module Crystalline::Analysis
     nil
   ensure
     # Propagate diagnostics to the client.
-    diagnostics.try &.publish(server) unless ignore_diagnostics
+    if !ignore_diagnostics && (!diagnostics_current || diagnostics_current.call)
+      diagnostics.try &.publish(server, versions: diagnostic_versions)
+    end
   end
 
   # Return the node at the given *location*.

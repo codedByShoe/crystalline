@@ -15,7 +15,7 @@ class Crystalline::BrokenSourceFixer
     # or when we find a wrong indentation.
     stack = [] of LineInfo
 
-    lines = source.lines
+    lines = source.lines.map { |line| fix_dangling_assignment(line) }
     lines.each_with_index do |line, line_index|
       next if line.blank?
 
@@ -69,7 +69,15 @@ class Crystalline::BrokenSourceFixer
       lines[-1] = "#{lines[-1]}; #{closing_keyword(line_info)}"
     end
 
-    lines.join("\n")
+    # `String#lines` drops the trailing terminator, so the naive `join` returns a
+    # source with one line less than the original whenever the document ends with
+    # a newline. Callers map cursor positions onto the fixed source, so the line
+    # count has to be preserved.
+    separator = source.includes?("\r\n") ? "\r\n" : "\n"
+    String.build do |str|
+      lines.join(str, separator)
+      str << separator if source.ends_with?('\n')
+    end
   end
 
   private def self.line_indent(line : String) : Int32?
@@ -82,6 +90,17 @@ class Crystalline::BrokenSourceFixer
       non_whitespace_char_index // 2
     else
       0
+    end
+  end
+
+  private def self.fix_dangling_assignment(line : String) : String
+    # While typing an assignment, `name =` is a common transient state. It is
+    # safe to use `nil` as a placeholder because error-tolerant semantic analysis
+    # can continue even when the eventual value is expected to have another type.
+    if line.matches?(/[^=!<>~]=\s*$/)
+      "#{line} nil"
+    else
+      line
     end
   end
 

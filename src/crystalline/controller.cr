@@ -8,6 +8,11 @@ class Crystalline::Controller
   # Used to process certain requests synchronously.
   @documents_lock = Mutex.new
   @compiler_lock = Mutex.new
+  # Every message is delegated to its own fiber, and fibers run in parallel when
+  # the server is built with `-Dpreview_mt`, so the request bookkeeping below is
+  # guarded rather than accessed directly.
+  @requests_lock = Mutex.new
+  @latest_completion_request : LSP::RequestMessage::RequestId? = nil
 
   def initialize(@server : LSP::Server)
     @server.start(self)
@@ -19,7 +24,7 @@ class Crystalline::Controller
 
   def when_ready : Nil
     # Compile the workspace at once.
-    spawn same_thread: true do
+    spawn do
       workspace.projects.each do |p|
         if (entry_point = p.entry_point?)
           workspace.compile(@server, entry_point)
@@ -28,10 +33,27 @@ class Crystalline::Controller
     end
   end
 
+  # Whether *id* is still awaited by the client.
+  private def pending?(id : LSP::RequestMessage::RequestId) : Bool
+    @requests_lock.synchronize { @pending_requests.includes?(id) }
+  end
+
+  # Registers *id* as the newest completion request, superseding any older one.
+  private def latest_completion_request=(id : LSP::RequestMessage::RequestId)
+    @requests_lock.synchronize { @latest_completion_request = id }
+  end
+
+  # Whether *id* is both still awaited and the newest completion request.
+  private def current_completion_request?(id : LSP::RequestMessage::RequestId) : Bool
+    @requests_lock.synchronize do
+      @latest_completion_request == id && @pending_requests.includes?(id)
+    end
+  end
+
   # The compiler unfortunately prevents declaring the following signature for the time being:
   # def on_request(message : LSP::RequestMessage(T)) : T forall T
   def on_request(message : LSP::RequestMessage)
-    @pending_requests << message.id
+    @requests_lock.synchronize { @pending_requests << message.id }
     case message
     when LSP::DocumentFormattingRequest
       @documents_lock.synchronize {
@@ -61,43 +83,51 @@ class Crystalline::Controller
       }
     when LSP::HoverRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         file_uri = URI.parse message.params.text_document.uri
         workspace.hover(@server, file_uri, message.params.position)
       end
     when LSP::DefinitionRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         file_uri = URI.parse message.params.text_document.uri
         workspace.definitions(@server, file_uri, message.params.position)
       end
     when LSP::ReferencesRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         workspace.references(@server, message.params)
       end
     when LSP::DocumentHighlightRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         workspace.document_highlights(@server, message.params)
       end
     when LSP::RenameRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         workspace.rename(@server, message.params)
       end
     when LSP::SignatureHelpRequest
       @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
+        return nil unless pending?(message.id)
         file_uri = URI.parse message.params.text_document.uri
         workspace.signature_help(@server, file_uri, message.params.position)
       end
     when LSP::CompletionRequest
-      @compiler_lock.synchronize do
-        return nil unless @pending_requests.includes? message.id
-        file_uri = URI.parse message.params.text_document.uri
-        workspace.completion(@server, file_uri, message.params.position, message.params.context.try &.trigger_character)
-      end
+      # Completion requests arrive on independent fibers. Keep only the newest
+      # request waiting for the compiler so typing cannot build an arbitrarily
+      # long queue of obsolete prefixes.
+      self.latest_completion_request = message.id
+      return nil unless current_completion_request?(message.id)
+      file_uri = URI.parse message.params.text_document.uri
+      workspace.completion(
+        @server,
+        file_uri,
+        message.params.position,
+        message.params.context.try &.trigger_character,
+        cancelled: -> { !current_completion_request?(message.id) },
+      )
     when LSP::DocumentSymbolsRequest
       @documents_lock.synchronize do
         file_uri = URI.parse message.params.text_document.uri
@@ -129,7 +159,10 @@ class Crystalline::Controller
     LSP::Log.warn(exception: e) { e.to_s }
     nil
   ensure
-    @pending_requests.delete message.id
+    @requests_lock.synchronize do
+      @pending_requests.delete message.id
+      @latest_completion_request = nil if @latest_completion_request == message.id
+    end
   end
 
   def on_notification(message : LSP::NotificationMessage) : Nil
@@ -161,7 +194,7 @@ class Crystalline::Controller
         }
       end
     when LSP::CancelNotification
-      @pending_requests.delete message.params.id
+      @requests_lock.synchronize { @pending_requests.delete message.params.id }
     end
   rescue e : Crystal::TypeException
     LSP::Log.warn(exception: e) { e.to_s }

@@ -12,7 +12,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crystal: [1.20.0, 1.21.0]
+        # Crystalline embeds the compiler it is built with, so the build version
+        # decides which language user code is analyzed against. There is no point
+        # testing against a version no release would ever be built with.
+        crystal: [1.21.0]
     steps:
       - name: Download source
         uses: actions/checkout@v6.0.2

@@ -1,4 +1,13 @@
 module Crystalline::Utils
+  # Build a `file://` uri for a filesystem *path*.
+  #
+  # The path has to be percent-encoded, otherwise a path containing spaces or
+  # non-ascii characters produces a uri that does not match the one the client
+  # sent for the very same file - and every lookup keyed by uri silently misses.
+  def self.file_uri(path : String | Path) : String
+    "file://#{URI.encode_path(path.to_s)}"
+  end
+
   def self.map_completion_kind(kind, *, default = LSP::CompletionItemKind::Variable)
     case kind
     when Crystal::FileModule

@@ -12,11 +12,16 @@ class Crystalline::Project
     relative_main = shard_yaml.dig?("crystalline", "main").try &.as_s
     # Else if shard.yml has a `targets/[shard name]/main` key, use that.
     relative_main ||= shard_yaml.dig?("targets", shard_name, "main").try &.as_s
+    # A library shard declares no target at all. By convention its entry point is
+    # `src/[shard name].cr` - the file `require "[shard name]"` resolves to - and
+    # analyzing that covers the whole shard, where treating every file as its own
+    # target only ever sees one file's worth of it.
+    relative_main ||= File.join("src", "#{shard_name}.cr")
     if relative_main && File.exists? Path[root_uri.decoded_path, relative_main]
       main_path = Path[root_uri.decoded_path, relative_main]
       # Add the entry point as a dependency to itself.
       dependencies << main_path.to_s
-      URI.parse("file://#{main_path}")
+      URI.parse(Utils.file_uri(main_path))
     end
   rescue e
     nil
@@ -58,7 +63,7 @@ class Crystalline::Project
 
           if is_directory && has_shard_yml && is_not_lib
             normalized_path = Path[workspace_root_uri.decoded_path, path].normalize
-            acc << Project.new(URI.parse("file://#{normalized_path}"))
+            acc << Project.new(URI.parse(Utils.file_uri(normalized_path)))
           else
             acc
           end
