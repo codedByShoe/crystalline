@@ -323,6 +323,57 @@ describe "Workspace#completion" do
     edit.range.end.character.should eq(11)
   end
 
+  it "reuses analyzed items across documents with the same receiver type" do
+    # Analyzing `uninitialized String` reads the prelude and the project's
+    # shards, never the project's own sources, so the answer cannot change
+    # between two documents - and recomputing it is the bulk of what a `.`
+    # completion costs.
+    source = <<-CRYSTAL
+    value : String = "something"
+    value.
+    CRYSTAL
+
+    result, workspace, server, uri = completion_at(source, 1, 6, "completion_receiver_reuse_a.cr")
+    completion_labels(result).any?(&.starts_with?("upcase")).should be_true
+    workspace.receiver_items_cached?(uri, "uninitialized String").should be_true
+
+    other_uri = URI.parse("file:///tmp/completion_receiver_reuse_b.cr")
+    workspace.open_document(LSP::DidOpenTextDocumentParams.new(
+      text_document: LSP::TextDocumentItem.new(
+        uri: other_uri.to_s,
+        language_id: "crystal",
+        version: 1,
+        text: "other : String = \"else\"\nother.\n",
+      ),
+    ))
+
+    reused = Crystalline::SpecSupport.run_with_fake_client(server) do
+      workspace.completion(server, other_uri, LSP::Position.new(line: 1, character: 6), ".")
+    end
+    completion_labels(reused).any?(&.starts_with?("upcase")).should be_true
+
+    # Answering the second document without analyzing anything is what leaves it
+    # without a memoized compiler result of its own.
+    workspace.completion_result_cached?(other_uri.to_s).should be_false
+  end
+
+  it "reuses analyzed items between two different string literals" do
+    # Typing changes the literal a local is assigned, which would otherwise make
+    # every edit look like a receiver that has never been analyzed.
+    _, workspace, server, uri = completion_at("greeting = \"hello\"\ngreeting.\n", 1, 9, "completion_literal_fold_a.cr")
+    workspace.receiver_items_cached?(uri, "uninitialized String").should be_true
+
+    workspace.opened_documents[uri.to_s].contents = "greeting = \"hello there\"\ngreeting.\n"
+    repeated = Crystalline::SpecSupport.run_with_fake_client(server) do
+      workspace.completion(server, uri, LSP::Position.new(line: 1, character: 9), ".")
+    end
+    completion_labels(repeated).any?(&.starts_with?("upcase")).should be_true
+
+    # A numeric literal keeps its own spelling: the width is part of it.
+    _, int_workspace, _, int_uri = completion_at("count = 1_i64\ncount.\n", 1, 6, "completion_literal_fold_b.cr")
+    int_workspace.receiver_items_cached?(int_uri, "1_i64").should be_true
+  end
+
   it "still completes when a different line is temporarily incomplete" do
     source = <<-CRYSTAL
     class Greeter

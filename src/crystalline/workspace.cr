@@ -21,6 +21,13 @@ class Crystalline::Workspace
   # latest result per document instead of compiling that input repeatedly.
   @completion_cache = {} of String => {String, Crystal::Compiler::Result, Crystal::Location}
   @completion_items_cache = {} of String => {String, Array(LSP::CompletionItem)}
+  # Completion items for a standalone receiver expression such as
+  # `uninitialized String`. That analysis loads the prelude and the project's
+  # shards but never the project's own sources, so its answer depends on nothing
+  # an editing session changes and is worth keeping for the whole session.
+  @receiver_items_cache = {} of String => Array(LSP::CompletionItem)
+  # When the dependencies of each project were last recomputed.
+  @dependency_attempts = {} of String => Time::Instant
   # Syntax-only completion answers are built by parsing the whole project. Keep
   # the parse of every file around, keyed by a stamp of its contents, so typing
   # does not re-read and re-parse the project on every keystroke.
@@ -31,6 +38,7 @@ class Crystalline::Workspace
   @completion_cache_lock = Mutex.new
   @source_index_lock = Mutex.new
   @documents_lock = Mutex.new
+  @dependency_attempts_lock = Mutex.new
   # The workspace filesystem uri.
   getter root_uri : URI?
   # A list of documents that are openened in the text editor.
@@ -117,6 +125,13 @@ class Crystalline::Workspace
     @completion_cache_lock.synchronize { @completion_cache.has_key?(uri) }
   end
 
+  # Whether analyzed items are being kept for the receiver *expression* as it
+  # would be resolved from *file_uri*.
+  def receiver_items_cached?(file_uri : URI, expression : String) : Bool
+    key = receiver_items_cache_key(file_uri, expression)
+    @completion_cache_lock.synchronize { @receiver_items_cache.has_key?(key) }
+  end
+
   # Drop memoized completion results, optionally keeping the entry for a single
   # document uri.
   private def invalidate_completion_caches(*, except : String? = nil)
@@ -165,6 +180,37 @@ class Crystalline::Workspace
     Dir.cd(root) { yield }
   end
 
+  # How long to wait before recomputing the dependencies of a project whose last
+  # attempt left it with nothing.
+  DEPENDENCY_RETRY_INTERVAL = 10.seconds
+
+  # Recompute the dependencies of *project* if they look incomplete, at most
+  # once per `DEPENDENCY_RETRY_INTERVAL`.
+  #
+  # A failed calculation leaves the project with no dependencies, which is the
+  # very condition that asks for another attempt - so an entry point that does
+  # not compile makes every request pay for two compilations instead of one, for
+  # as long as it stays broken. Waiting between attempts bounds that to one
+  # wasted compilation per interval while still recovering on its own once the
+  # entry point is fixed.
+  private def recalculate_stale_dependencies(server, project)
+    return unless project.dependencies.size < 2
+
+    now = @result_cache.monotonic_now
+    key = project.root_uri.to_s
+    due = @dependency_attempts_lock.synchronize do
+      last_attempt = @dependency_attempts[key]?
+      if last_attempt.nil? || now - last_attempt >= DEPENDENCY_RETRY_INTERVAL
+        @dependency_attempts[key] = now
+        true
+      else
+        false
+      end
+    end
+
+    recalculate_dependencies(server, project) if due
+  end
+
   # Run a top level semantic analysis to compute dependencies.
   def recalculate_dependencies(server, project)
     return unless (target = project.entry_point?)
@@ -202,11 +248,11 @@ class Crystalline::Workspace
     discard_nil_cached_result = false,
     cancelled : Proc(Bool)? = nil,
   )
+    # If a project has less than 1 dependency, it could mean that the last
+    # dependency calculation failed (likely because of a syntax error). So we
+    # try again, but not on every single request.
     @projects.each do |project|
-      # If the project has less than 1 dependency, it could mean that the last
-      # dependency calculation failed (likely because of a syntax error). So we
-      # try again.
-      recalculate_dependencies(server, project) if project.dependencies.size < 2
+      recalculate_stale_dependencies(server, project)
     end
 
     project = Project.best_fit_for_file(@projects, file_uri)
@@ -669,20 +715,32 @@ class Crystalline::Workspace
       return finalize_completion(cached_items[1], completion_context, position.line)
     end
 
+    # Literal and explicitly typed local receivers can be analyzed in a tiny
+    # standalone source. This avoids a whole-project build for the most common
+    # completion while editing, and continues to work when unrelated project
+    # code is temporarily invalid.
+    receiver_expression = standalone_receiver_expression(contents, position, completion_context)
+    receiver_items_key = receiver_expression.try { |expression| receiver_items_cache_key(file_uri, expression) }
+    # Editing invalidates the caches keyed by document contents on every
+    # keystroke, but the answer for `uninitialized String` is the same one it was
+    # the last time any document asked - and recomputing it means analyzing the
+    # prelude again, which is the bulk of what a `.` completion costs.
+    if receiver_items_key && (items = cached_receiver_items(receiver_items_key))
+      return finalize_completion(items, completion_context, position.line)
+    end
+
     cached = @completion_cache_lock.synchronize { @completion_cache[file_uri.to_s]? }.try do |cached_source, cached_result, cached_location|
       {cached_result, cached_location} if cached_source == completion_cache_key
     end
     result = cached.try(&.[0])
     location = cached.try(&.[1]) || location
+    analyzed_receiver_expression = false
 
-    # Literal and explicitly typed local receivers can be analyzed in a tiny
-    # standalone source. This avoids a whole-project build for the most common
-    # completion while editing, and continues to work when unrelated project
-    # code is temporarily invalid.
-    unless result
-      fast_result = fast_receiver_compile(server, file_uri, contents, position, completion_context)
+    if !result && receiver_expression
+      fast_result = fast_receiver_compile(server, file_uri, receiver_expression)
       if fast_result
         result, location = fast_result
+        analyzed_receiver_expression = true
         store_completion_result(file_uri, completion_cache_key, result, location)
       end
     end
@@ -870,6 +928,12 @@ class Crystalline::Workspace
       @completion_cache_lock.synchronize do
         @completion_items_cache[file_uri.to_s] = {completion_cache_key, completion_items}
       end
+      # Only what the standalone analysis produced is reusable across documents:
+      # items from a whole-project build describe this project's code, which the
+      # next keystroke can change.
+      if receiver_items_key && analyzed_receiver_expression
+        store_receiver_items(receiver_items_key, completion_items)
+      end
       finalize_completion(completion_items, completion_context, position.line)
     end
   rescue e
@@ -927,18 +991,60 @@ class Crystalline::Workspace
     LSP::CompletionList.new(is_incomplete: false, items: completion_items)
   end
 
-  private def fast_receiver_compile(server : LSP::Server, file_uri : URI, contents : String, position : LSP::Position, context : CompletionContext) : {Crystal::Compiler::Result, Crystal::Location}?
+  # The standalone expression that stands in for the receiver at *position*,
+  # when it is one that can be analyzed without the rest of the project.
+  private def standalone_receiver_expression(contents : String, position : LSP::Position, context : CompletionContext) : String?
     return unless context.trigger_character == "."
 
     receiver = context.analysis_prefix.strip
-    expression = if literal_completion_expression?(receiver)
-                   receiver
-                 elsif receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
-                   local_receiver_expression(receiver, contents, position) || return
-                 else
-                   return
-                 end
+    if literal_completion_expression?(receiver)
+      normalized_receiver_expression(receiver)
+    elsif receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
+      local_receiver_expression(receiver, contents, position)
+    end
+  end
 
+  # Every string literal is the same receiver as far as completion is concerned,
+  # so analyzing one is worth reusing for the next. Only literals whose type is
+  # unambiguous from their first character are folded: a numeric literal carries
+  # its own width in a suffix, and a collection literal carries the types of its
+  # elements, so both are analyzed as written.
+  private def normalized_receiver_expression(value : String) : String
+    type = case value
+           when /\A"/                   then "String"
+           when /\A'/                   then "Char"
+           when /\A(?:true|false)\s*\z/ then "Bool"
+           end
+
+    type ? "uninitialized #{type}" : value
+  end
+
+  # How many receiver expressions to remember the items of.
+  RECEIVER_ITEMS_CACHE_LIMIT = 64
+
+  # Items analyzed from a receiver expression depend on the prelude and on the
+  # shards reachable from *file_uri*, and on nothing else - so the lib path is
+  # all that has to be part of the key alongside the expression itself.
+  private def receiver_items_cache_key(file_uri : URI, expression : String) : String
+    "#{Project.best_fit_for_file(@projects, file_uri).try(&.default_lib_path)}\0#{expression}"
+  end
+
+  private def cached_receiver_items(key : String) : Array(LSP::CompletionItem)?
+    @completion_cache_lock.synchronize { @receiver_items_cache[key]? }
+  end
+
+  private def store_receiver_items(key : String, items : Array(LSP::CompletionItem))
+    return if items.empty?
+
+    @completion_cache_lock.synchronize do
+      # Bounded, so a long session cannot accumulate the methods of every type it
+      # ever completed on. Entries are equally valuable, so evict the oldest.
+      @receiver_items_cache.shift? if @receiver_items_cache.size >= RECEIVER_ITEMS_CACHE_LIMIT
+      @receiver_items_cache[key] = items
+    end
+  end
+
+  private def fast_receiver_compile(server : LSP::Server, file_uri : URI, expression : String) : {Crystal::Compiler::Result, Crystal::Location}?
     synthetic_name = "__crystalline_receiver"
     source = Crystal::Compiler::Source.new(
       "__crystalline_completion__.cr",
@@ -994,7 +1100,7 @@ class Crystalline::Workspace
     if explicit_type
       "uninitialized #{explicit_type}"
     elsif literal_completion_expression?(value)
-      value
+      normalized_receiver_expression(value)
     end
   end
 
