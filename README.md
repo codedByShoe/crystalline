@@ -70,9 +70,18 @@ Building from source does take a long time._
 
 ### Compatibility
 
+Crystalline embeds the Crystal compiler it is built with, so this table is not
+only a build requirement: the Crystal version in the left column is the one your
+code is analyzed against. A release built against an older compiler will report
+errors for language and standard library features newer than it.
+
+**Crystalline 0.19 requires Crystal 1.21**, and every published binary — Linux
+and macOS alike — is built with it.
+
 | Crystal   | Crystalline |
 | --------- | ----------- |
-| **1.20**  | **0.18**    |
+| **1.21**  | **0.19**    |
+| 1.20      | 0.18        |
 | 1.16      | 0.17        |
 | 1.15      | 0.16        |
 | 1.14      | 0.15        |
