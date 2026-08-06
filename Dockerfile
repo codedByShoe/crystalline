@@ -2,9 +2,10 @@ FROM crystallang/crystal:1.21.0-alpine
 
 WORKDIR /app
 
-# Add llvm deps.
+# Add llvm deps. The major must match what the base image was built against:
+# the 1.21.0-alpine image is Alpine v3.22, whose repositories carry llvm20.
 RUN apk add --update --no-cache --force-overwrite \
-      llvm21-dev llvm21-static g++ libxml2-static zstd-static make
+      llvm20-dev llvm20-static g++ libxml2-static zstd-static make
 
 # Build crystalline.
 COPY . /app/
