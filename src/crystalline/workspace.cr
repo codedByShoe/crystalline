@@ -3,6 +3,7 @@ require "yaml"
 require "./text_document"
 require "./compilation_lock"
 require "./index"
+require "./resolver"
 require "./progress"
 require "./project"
 require "./result_cache"
@@ -1387,52 +1388,59 @@ class Crystalline::Workspace
   end
 
   private def syntax_method_items(file_uri : URI, contents : String, position : LSP::Position, context : CompletionContext) : Array(LSP::CompletionItem)?
-    receiver = context.analysis_prefix.strip
-    owner = nil
-    class_method = false
+    written, class_method = syntax_receiver_type(context.analysis_prefix.strip, contents, position)
+    return unless written
 
-    if receiver.matches?(/\A[A-Z]\w*(?:::[A-Z]\w*)*\z/)
-      owner = receiver
-      class_method = true
-    elsif match = receiver.match(/([A-Z]\w*(?:::[A-Z]\w*)*)\.new(?:\(.*\))?$/)
-      owner = match[1]
-    elsif receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
-      lines_before_cursor = contents.lines[0...position.line]
-      lines_before_cursor.reverse_each do |line|
-        if match = line.match(/^\s*#{Regex.escape(receiver)}\s*:\s*([A-Z]\w*(?:::[A-Z]\w*)*)/)
-          owner = match[1]
-          break
-        elsif match = line.match(/^\s*#{Regex.escape(receiver)}\s*=\s*([A-Z]\w*(?:::[A-Z]\w*)*)\.new\b/)
-          owner = match[1]
-          break
-        end
-      end
-
-      unless owner
-        prefix = lines_before_cursor.join("\n")
-        matches = prefix.scan(/\b#{Regex.escape(receiver)}\s*:\s*([A-Z]\w*(?:::[A-Z]\w*)*)/)
-        owner = matches.last?.try(&.[1])
-      end
-    end
-    return unless owner
-
+    # The buffer is mid-edit, so the receiver line is replaced by one that
+    # parses before anything is asked of it.
     parse_lines = contents.lines(chomp: false)
     parse_lines[position.line] = context.rewritten_line
-    items = source_methods(file_uri, parse_lines.join).compact_map do |method|
-      next unless method.owner == owner && method.class_method == class_method
+    repaired = parse_lines.join
+
+    resolver = Resolver.new(@index.project_entries(file_uri, buffer_sources, current_source: repaired))
+    # `Inner.` inside `module Outer` means `Outer::Inner`, and the receiver as
+    # written says nothing about which one that is.
+    fqn = resolver.resolve(written, enclosing_namespaces(file_uri, repaired, position))
+    return unless fqn
+
+    range = context.completion_range(position.line)
+    resolver.members(fqn, class_method).map do |method|
       LSP::CompletionItem.new(
         label: method.detail,
         insert_text: method.name,
         filter_text: method.name,
         kind: LSP::CompletionItemKind::Method,
-        text_edit: LSP::TextEdit.new(
-          range: context.completion_range(position.line),
-          new_text: method.name,
-        ),
+        documentation: method.doc.try { |doc| LSP::MarkupContent.new(kind: LSP::MarkupKind::MarkDown, value: doc) },
+        text_edit: LSP::TextEdit.new(range: range, new_text: method.name),
       )
     end
+  end
 
-    items
+  # The type a receiver names, as written, and whether it was named as a type
+  # rather than as a value of one.
+  private def syntax_receiver_type(receiver : String, contents : String, position : LSP::Position) : {String?, Bool}
+    if receiver.matches?(/\A(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*\z/)
+      return {receiver, true}
+    end
+
+    if match = receiver.match(/((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\.new(?:\(.*\))?$/)
+      return {match[1], false}
+    end
+
+    return {nil, false} unless receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
+
+    lines_before_cursor = contents.lines[0...position.line]
+    lines_before_cursor.reverse_each do |line|
+      if match = line.match(/^\s*#{Regex.escape(receiver)}\s*:\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)/)
+        return {match[1], false}
+      elsif match = line.match(/^\s*#{Regex.escape(receiver)}\s*=\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\.new\b/)
+        return {match[1], false}
+      end
+    end
+
+    prefix = lines_before_cursor.join("\n")
+    matches = prefix.scan(/\b#{Regex.escape(receiver)}\s*:\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)/)
+    {matches.last?.try(&.[1]), false}
   end
 
   private def source_methods(file_uri : URI, current_source : String) : Array(Analysis::SourceMethod)

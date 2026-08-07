@@ -211,6 +211,99 @@ describe "completion without an analysis to answer from" do
     result.not_nil!.items.map(&.label).any?(&.starts_with?("build")).should be_true
     result.not_nil!.is_incomplete.should be_true
   end
+
+  it "offers what a receiver inherits" do
+    source = <<-CRYSTAL
+    class Base
+      def inherited_method
+      end
+    end
+
+    class Widget < Base
+      def own_method
+      end
+    end
+
+    widget = Widget.new
+    widget.
+    CRYSTAL
+
+    workspace, server, uri = Crystalline::SpecSupport.open_document(source, "inheriting_fixture.cr")
+    line = source.lines.index("widget.").not_nil!
+
+    result = within(5.seconds) do
+      workspace.completion(server, uri, LSP::Position.new(line: line, character: 7), ".")
+    end
+
+    labels = result.not_nil!.items.map(&.label)
+    labels.any?(&.starts_with?("own_method")).should be_true
+    # Which the receiver only responds to because of what it descends from, and
+    # which used to need a whole project analysis to know about.
+    labels.any?(&.starts_with?("inherited_method")).should be_true
+    # Answered from the parse: no analysis existed and no compilation was run.
+    workspace.analysis_stored?(uri).should be_false
+    workspace.completion_result_cached?(uri.to_s).should be_false
+  end
+
+  it "offers a constructor for the initialize a receiver declares" do
+    source = <<-CRYSTAL
+    class Widget
+      def initialize(@name : String)
+      end
+
+      def self.described
+      end
+    end
+
+    Widget.
+    CRYSTAL
+
+    workspace, server, uri = Crystalline::SpecSupport.open_document(source, "constructing_fixture.cr")
+    line = source.lines.index("Widget.").not_nil!
+
+    result = within(5.seconds) do
+      workspace.completion(server, uri, LSP::Position.new(line: line, character: 7), ".")
+    end
+
+    labels = result.not_nil!.items.map(&.label)
+    labels.any?(&.starts_with?("described")).should be_true
+    # `new` is written nowhere in that source. It is what `initialize` means.
+    labels.any?(&.starts_with?("new")).should be_true
+  end
+
+  it "resolves a receiver against the namespace it is written in" do
+    source = <<-CRYSTAL
+    module Outer
+      class Inner
+        def inner_method
+        end
+      end
+
+      class Other
+        def run
+          Inner.new.
+        end
+      end
+    end
+
+    class Inner
+      def top_level_method
+      end
+    end
+    CRYSTAL
+
+    workspace, server, uri = Crystalline::SpecSupport.open_document(source, "scoped_fixture.cr")
+    line = source.lines.index("      Inner.new.").not_nil!
+
+    result = within(5.seconds) do
+      workspace.completion(server, uri, LSP::Position.new(line: line, character: 16), ".")
+    end
+
+    labels = result.not_nil!.items.map(&.label)
+    # `Inner` written inside `Outer` is `Outer::Inner`, never the one beside it.
+    labels.any?(&.starts_with?("inner_method")).should be_true
+    labels.any?(&.starts_with?("top_level_method")).should be_false
+  end
 end
 
 describe "Workspace#warm_syntax_index" do
