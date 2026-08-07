@@ -15,7 +15,8 @@ class Crystalline::Index
     stamp : String,
     methods : Array(Analysis::SourceMethod),
     types : Array({String, LSP::CompletionItemKind}),
-    symbols : Array(LSP::DocumentSymbol)
+    symbols : Array(LSP::DocumentSymbol),
+    declarations : Analysis::Declarations
 
   @entries = {} of String => Entry
   # Entries are read and written from the fibers serving requests, and from the
@@ -72,11 +73,13 @@ class Crystalline::Index
 
     methods = Analysis::SourceMethodsVisitor.new.tap { |visitor| ast.accept(visitor) }.methods
     symbols = Analysis::DocumentSymbolsVisitor.new.tap { |visitor| ast.accept(visitor) }.symbols
+    declarations = Analysis::DeclarationsVisitor.new.tap { |visitor| ast.accept(visitor) }.declarations
     entry = Entry.new(
       stamp: stamp,
       methods: methods,
       types: flatten_type_symbols(symbols),
       symbols: symbols,
+      declarations: declarations,
     )
     @lock.synchronize { @entries[path] = entry }
     entry
