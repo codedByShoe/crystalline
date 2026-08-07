@@ -1,6 +1,7 @@
 require "uri"
 require "yaml"
 require "./text_document"
+require "./compilation_lock"
 require "./progress"
 require "./project"
 require "./result_cache"
@@ -242,7 +243,13 @@ class Crystalline::Workspace
   end
 
   # Allow one compilation at a time.
-  class_getter compilation_lock = Mutex.new
+  class_getter compilation_lock = CompilationLock.new
+
+  # How long a completion will wait for the compiler to become free before
+  # answering without it. This is a budget for what a person will sit through
+  # watching for a popup, so it does not scale with the size of the project -
+  # the whole point is that a big project cannot spend the seconds it needs.
+  COMPLETION_COMPILE_BUDGET = 1.second
 
   # Use the crystal compiler to typecheck the program.
   def compile(
@@ -707,7 +714,11 @@ class Crystalline::Workspace
         return analysis_result unless analysis_result.items.empty?
       end
       if syntax_items && !syntax_items.empty?
-        return finalize_completion(syntax_items, completion_context, position.line)
+        # Only what the buffer spells out, with nothing a type inherits or
+        # generates, because no analysis was there to be asked. Incomplete, so
+        # the client keeps asking as typing continues and takes the full answer
+        # as soon as one exists.
+        return finalize_completion(syntax_items, completion_context, position.line, incomplete: true)
       end
     end
 
@@ -757,6 +768,17 @@ class Crystalline::Workspace
     result = cached.try(&.[0])
     location = cached.try(&.[1]) || location
     analyzed_receiver_expression = false
+
+    # Everything past this point runs the compiler, and only one analysis runs
+    # at a time. A compilation that is nearly over is worth waiting out, but the
+    # project-wide analysis at startup is not: answering once it finishes means
+    # answering a keystroke that stopped being interesting many keystrokes ago.
+    # Give up instead, and say the answer is incomplete so the client asks again
+    # as typing continues - by which time there is an analysis to answer from.
+    if !result && !@@compilation_lock.wait_until_available(COMPLETION_COMPILE_BUDGET)
+      LSP::Log.debug { "Gave up waiting to compile a completion of #{file_uri}" }
+      return LSP::CompletionList.new(is_incomplete: true, items: [] of LSP::CompletionItem)
+    end
 
     if !result && receiver_expression
       fast_result = fast_receiver_compile(server, file_uri, receiver_expression)
@@ -976,7 +998,7 @@ class Crystalline::Workspace
     "#{context.trigger_character}\0#{lines.join}"
   end
 
-  private def finalize_completion(source_items : Array(LSP::CompletionItem), context : CompletionContext, line : Int32) : LSP::CompletionList
+  private def finalize_completion(source_items : Array(LSP::CompletionItem), context : CompletionContext, line : Int32, *, incomplete = false) : LSP::CompletionList
     range = context.completion_range(line)
     completion_items = source_items.map do |source_item|
       item = source_item
@@ -1008,7 +1030,7 @@ class Crystalline::Workspace
       completion_items[selected_element_index] = selected_element
     end
 
-    LSP::CompletionList.new(is_incomplete: false, items: completion_items)
+    LSP::CompletionList.new(is_incomplete: incomplete, items: completion_items)
   end
 
   # The standalone expression that stands in for the receiver at *position*,
@@ -1462,8 +1484,7 @@ class Crystalline::Workspace
         elsif (buffer = buffers[normalized]?)
           index_entry(normalized, buffer, stamp: "buffer:#{buffer.hash}")
         else
-          info = File.info(path)
-          stamp = "disk:#{info.modification_time.to_unix_ns}:#{info.size}"
+          stamp = disk_stamp(path)
           cached_index_entry(normalized, stamp) || index_entry(normalized, File.read(path), stamp: stamp)
         end
       rescue e
@@ -1471,6 +1492,50 @@ class Crystalline::Workspace
         nil
       end
     end
+  end
+
+  # Parse every file of every project once, up front.
+  #
+  # The syntax index is what answers a request the compiler is not free to
+  # serve, and it is otherwise built on first use - so the request least able to
+  # afford it is the one that pays for reading and parsing the whole project.
+  # This needs no compiler, so it runs while the first analysis still holds it.
+  def warm_syntax_index : Nil
+    buffers = document_sources_by_path(documents_snapshot)
+
+    @projects.each do |project|
+      crystal_files_in(project).each do |path|
+        normalized = Path[path].normalize.to_s
+        # An opened buffer is reindexed whenever it changes anyway, and there
+        # are few enough of them for that to cost nothing.
+        next if buffers.has_key?(normalized)
+
+        stamp = disk_stamp(path)
+        index_entry(normalized, File.read(path), stamp: stamp) unless cached_index_entry(normalized, stamp)
+      rescue e
+        LSP::Log.debug(exception: e) { "Unable to index #{path}" }
+      ensure
+        # Requests are served while this runs, and a whole project is a lot of
+        # parsing to hold a single-threaded scheduler for.
+        Fiber.yield
+      end
+    end
+
+    LSP::Log.info { "[workspace] Syntax index ready" }
+  end
+
+  # Whether a parse of *path* is being kept for the contents it has on disk.
+  def syntax_indexed?(path : String) : Bool
+    normalized = Path[path].normalize.to_s
+    !cached_index_entry(normalized, disk_stamp(normalized)).nil?
+  rescue
+    false
+  end
+
+  # Identifies the contents of a file without reading it.
+  private def disk_stamp(path : String) : String
+    info = File.info(path)
+    "disk:#{info.modification_time.to_unix_ns}:#{info.size}"
   end
 
   private def cached_index_entry(path : String, stamp : String) : SourceIndexEntry?
@@ -1590,8 +1655,7 @@ class Crystalline::Workspace
       entry = if (buffer = buffers[normalized]?)
                 index_entry(normalized, buffer, stamp: "buffer:#{buffer.hash}")
               else
-                info = File.info(path)
-                stamp = "disk:#{info.modification_time.to_unix_ns}:#{info.size}"
+                stamp = disk_stamp(path)
                 cached_index_entry(normalized, stamp) || index_entry(normalized, File.read(path), stamp: stamp)
               end
 

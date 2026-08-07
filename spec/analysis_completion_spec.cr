@@ -53,6 +53,9 @@ describe "completion from a stored analysis" do
     labels(result).any?(&.starts_with?("build")).should be_true
     labels(result).any?(&.starts_with?("new")).should be_true
     labels(result).size.should be > 5
+    # Answered from an analysis, so the client may filter it as the word grows
+    # rather than asking again for every character.
+    result.not_nil!.is_incomplete.should be_false
   end
 
   it "offers a method written since the analysis was made" do
