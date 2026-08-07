@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # A tag push is the normal trigger, but it is the only one - so an Actions
+  # outage at the wrong moment leaves a tag with no release and no way to build
+  # one. Dispatching with the tag name does exactly what pushing it would have.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.19.0"
+        required: true
+        type: string
 
 jobs:
   macos:
@@ -18,6 +27,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+        with:
+          # On a tag push this is already the tag; on a dispatch it is whatever
+          # branch was selected, so the tag has to be named explicitly.
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install Crystal
         env:
           HOMEBREW_NO_INSTALL_UPGRADE: 1
@@ -39,6 +52,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Build the static binary
         run: docker build -t crystalline .
       - name: Copy binary to host
@@ -71,6 +86,9 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3.0.0
         with:
+          # `github.ref_name` is the tag on a tag push, but the branch on a
+          # dispatch, which would publish a release against the wrong ref.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             ./artifacts/crystalline_x86_64-unknown-linux-musl.gz
             ./artifacts/crystalline_x86_64-apple-darwin.gz
