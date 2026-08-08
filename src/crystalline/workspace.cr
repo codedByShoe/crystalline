@@ -105,9 +105,10 @@ class Crystalline::Workspace
     # document keeps its own entry: its cache key embeds its contents, so a
     # meaningful edit misses on its own.
     invalidate_completion_caches(except: file_uri)
-    # Diagnostics are produced from a saved document version. Clear them as
-    # soon as the buffer changes so stale errors are not shown against new text.
-    Diagnostics.new.init_value(file_uri).publish(server, versions: document_versions)
+    # Diagnostics from the last compilation are kept on screen while the buffer
+    # changes. They drift as text moves, but replacing them with nothing on the
+    # first keystroke - to be redrawn only on the next save - reads as errors
+    # flashing in and out of existence. The next compilation replaces them.
   end
 
   def close_document(server : LSP::Server, params : LSP::DidCloseTextDocumentParams)
