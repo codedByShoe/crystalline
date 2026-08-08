@@ -397,7 +397,11 @@ A whole document or a text selection.
 #### Go to definition
 
 By clicking on a symbol with the Cmd or Ctrl key pressed (editor/platform
-dependent).
+dependent). The compiler provides the precise answer; when it has none - while
+the first build of the project is still running, when the buffer does not
+compile, or inside a method no call ever reaches (which the compiler never
+types) - a parse-level index of the project and its shards answers instead, so
+jumping to a type, method, or constant declared in the project keeps working.
 
 #### Find references and document highlights
 

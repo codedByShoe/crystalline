@@ -49,7 +49,8 @@ module Crystalline::Analysis
     extends : Array(String),
     type_vars : Array(String),
     doc : String?,
-    range : LSP::Range
+    range : LSP::Range,
+    file : String? = nil
 
   # A method declaration. `owner` is the qualified name of the type it was
   # written in, and is empty for a method at the top level.
@@ -62,7 +63,8 @@ module Crystalline::Analysis
     visibility : Crystal::Visibility,
     doc : String?,
     detail : String,
-    range : LSP::Range
+    range : LSP::Range,
+    file : String? = nil
 
   # `@name : Type` written in the body of a type. The restriction is the only
   # thing that says what an instance variable holds without inference, which is
@@ -80,7 +82,8 @@ module Crystalline::Analysis
     name : String,
     namespace : Array(String),
     value : String?,
-    range : LSP::Range
+    range : LSP::Range,
+    file : String? = nil
 
   # `require "path"`, with the path exactly as written. Resolving it to a file
   # needs the shard layout and the compiler's search path, which is a later

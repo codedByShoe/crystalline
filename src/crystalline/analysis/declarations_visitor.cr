@@ -103,6 +103,7 @@ module Crystalline::Analysis
         type_vars: [] of String,
         doc: node.doc,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
       false
     end
@@ -143,6 +144,7 @@ module Crystalline::Analysis
         doc: node.doc,
         detail: Utils.format_def(node, short: true),
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
       false
     end
@@ -195,6 +197,7 @@ module Crystalline::Analysis
       predicate = base.ends_with?('?')
       base = base.rchop('?')
       range = Utils.lsp_range_from_node(node)
+      file = file_of(node)
 
       node.args.each do |arg|
         name, restriction = accessor_target(arg)
@@ -203,10 +206,10 @@ module Crystalline::Analysis
         reader = predicate ? "#{name}?" : name
 
         unless base == "setter"
-          @methods << accessor(owner, reader, class_method, restriction, range)
+          @methods << accessor(owner, reader, class_method, restriction, range, file)
         end
         unless base == "getter"
-          @methods << accessor(owner, "#{name}=", class_method, nil, range,
+          @methods << accessor(owner, "#{name}=", class_method, nil, range, file,
             params: [ParamDecl.new("value", restriction, nil, false, false, false)])
         end
       end
@@ -227,6 +230,11 @@ module Crystalline::Analysis
     # The type currently being visited, or nil at the top level.
     private def current_type : String?
       @scope.empty? ? nil : @scope.join("::")
+    end
+
+    # The file a node was parsed from, which is where its declaration lives.
+    private def file_of(node : Crystal::ASTNode) : String?
+      node.location.try(&.original_filename)
     end
 
     private def qualify(name : String) : String
@@ -253,6 +261,7 @@ module Crystalline::Analysis
         type_vars: type_vars || [] of String,
         doc: node.doc,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
 
       @enclosing << @scope
@@ -282,10 +291,11 @@ module Crystalline::Analysis
         namespace: @scope.dup,
         value: value,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
     end
 
-    private def accessor(owner : String, name : String, class_method : Bool, restriction : String?, range : LSP::Range, params = [] of ParamDecl) : MethodDecl
+    private def accessor(owner : String, name : String, class_method : Bool, restriction : String?, range : LSP::Range, file : String?, params = [] of ParamDecl) : MethodDecl
       MethodDecl.new(
         owner: owner,
         name: name,
@@ -296,6 +306,7 @@ module Crystalline::Analysis
         doc: nil,
         detail: params.empty? ? name : "#{name}(#{params.join(", ")})",
         range: range,
+        file: file,
       )
     end
 

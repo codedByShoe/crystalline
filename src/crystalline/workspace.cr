@@ -241,11 +241,12 @@ class Crystalline::Workspace
   # Allow one compilation at a time.
   class_getter compilation_lock = CompilationLock.new
 
-  # How long a completion will wait for the compiler to become free before
-  # answering without it. This is a budget for what a person will sit through
-  # watching for a popup, so it does not scale with the size of the project -
-  # the whole point is that a big project cannot spend the seconds it needs.
-  COMPLETION_COMPILE_BUDGET = 1.second
+  # How long an interactive request - a completion, a hover, a highlight - will
+  # wait for the compiler to become free before answering without it. This is a
+  # budget for what a person will sit through watching for a popup, so it does
+  # not scale with the size of the project - the whole point is that a big
+  # project cannot spend the seconds it needs.
+  INTERACTIVE_COMPILE_BUDGET = 1.second
 
   # Use the crystal compiler to typecheck the program.
   def compile(
@@ -262,6 +263,7 @@ class Crystalline::Workspace
     top_level = false,
     discard_nil_cached_result = false,
     cancelled : Proc(Bool)? = nil,
+    wait_budget : Time::Span? = nil,
   )
     # If a project has less than 1 dependency, it could mean that the last
     # dependency calculation failed (likely because of a syntax error). So we
@@ -296,6 +298,16 @@ class Crystalline::Workspace
     if !ignore_cached_result && @result_cache.exists?(target_string) && !@result_cache.invalidated?(target_string)
       cached_result = @result_cache.get(target_string)
       return cached_result unless cached_result.nil? && discard_nil_cached_result
+    end
+
+    # A request that cannot answer from the cache has a whole compilation ahead
+    # of it, plus whatever compilation is already running. A caller with a
+    # budget would rather answer with nothing than answer a cursor position the
+    # user left behind - the project-wide build at startup takes tens of
+    # seconds, and it is exactly then that every request needs a compile.
+    if wait_budget && !@@compilation_lock.wait_until_available(wait_budget)
+      LSP::Log.debug { "Gave up waiting for the compiler to answer about #{file_uri}" }
+      return
     end
 
     # Wait for pending compilations to finish…
@@ -418,7 +430,10 @@ class Crystalline::Workspace
   end
 
   def hover(server : LSP::Server, file_uri : URI, position : LSP::Position)
-    result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
+    # Budgeted: a tooltip that appears after the whole project builds is a
+    # tooltip for text the cursor already left. Answering with nothing lets the
+    # next hover try again, by which time the result is usually cached.
+    result = self.compile(server, file_uri, in_memory: true, wants_doc: true, wait_budget: INTERACTIVE_COMPILE_BUDGET)
     location = Crystal::Location.new(
       file_uri.decoded_path,
       line_number: position.line + 1,
@@ -490,7 +505,22 @@ class Crystalline::Workspace
   end
 
   def definitions(server : LSP::Server, file_uri : URI, position : LSP::Position)
-    result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
+    semantic = semantic_definitions(server, file_uri, position)
+    return semantic if semantic && !semantic.empty?
+
+    # The compiler had no answer - it is busy with the startup build, the
+    # buffer does not compile, or the cursor is inside a method no call ever
+    # reaches, which the compiler never types. The parse index still knows
+    # where the project declares things.
+    syntax_definitions(file_uri, position)
+  end
+
+  private def semantic_definitions(server : LSP::Server, file_uri : URI, position : LSP::Position)
+    # Budgeted now that there is a fallback: during the first build of a large
+    # project, a go-to-definition that waits it out answers long after the
+    # user stopped looking. The syntax tier answers instantly instead, and the
+    # compiler's better answer takes over once an analysis exists.
+    result = self.compile(server, file_uri, in_memory: true, wants_doc: true, wait_budget: INTERACTIVE_COMPILE_BUDGET)
     location = Crystal::Location.new(
       file_uri.decoded_path,
       line_number: position.line + 1,
@@ -540,9 +570,129 @@ class Crystalline::Workspace
     nil
   end
 
-  def references(server : LSP::Server, params : LSP::ReferenceParams)
+  # Where the symbol under the cursor is declared, from the parse index alone.
+  #
+  # This is the tier that never waits: it answers on the first keystroke of a
+  # session and inside code the compiler cannot or has not typed. It also
+  # stops where the index stops - at the edge of the project and its shards -
+  # so a jump into the standard library is the semantic tier's to provide.
+  def syntax_definitions(file_uri : URI, position : LSP::Position) : Array(LSP::Location)?
+    document = document_at(file_uri.to_s)
+    return unless document
+
+    contents = document.contents
+    line = contents.lines(chomp: false)[position.line]?
+    return unless line
+
+    bounds = rename_symbol_bounds(line, position.character)
+    return unless bounds
+
+    start_char, end_char = bounds
+    symbol = line[start_char...end_char]
+    return if symbol.empty? || symbol.starts_with?('@') || CRYSTAL_KEYWORDS.includes?(symbol)
+
+    resolver = Resolver.new(@index.project_entries(file_uri, buffer_sources, current_source: contents))
+    namespaces = enclosing_namespaces(file_uri, contents, position)
+
+    locations =
+      if symbol[0].ascii_uppercase?
+        path_definitions(resolver, line, start_char, end_char, namespaces)
+      elsif start_char > 0 && line[start_char - 1]? == '.'
+        receiver_method_definitions(resolver, line[0...start_char - 1], symbol, contents, position, namespaces)
+      else
+        bare_call_definitions(resolver, symbol, namespaces)
+      end
+
+    locations.uniq! { |location| {location.uri, location.range.start.line, location.range.start.character} }
+    locations unless locations.empty?
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to answer a definition from syntax for #{file_uri}" }
+    nil
+  end
+
+  # The declaration sites of the type or constant that a path names.
+  private def path_definitions(resolver : Resolver, line : String, start_char : Int32, end_char : Int32, namespaces : Array(String)) : Array(LSP::Location)
+    path = constant_path_at(line, start_char, end_char)
+
+    if (fqn = resolver.resolve(path, namespaces))
+      decl_locations(resolver.type_declarations(fqn))
+    else
+      decl_locations(resolver.constant_declarations(path, namespaces))
+    end
+  end
+
+  # The constant path the cursor is inside, cut after the segment the cursor
+  # is on: in `News::Article`, a cursor on `News` names the module, and the
+  # segments to its left are kept only as the scope that qualifies it.
+  private def constant_path_at(line : String, start_char : Int32, end_char : Int32) : String
+    path_start = start_char
+    while path_start >= 2 && line[path_start - 2, 2] == "::"
+      segment_end = path_start - 2
+      segment_start = segment_end
+      while segment_start > 0 && (line[segment_start - 1].ascii_alphanumeric? || line[segment_start - 1] == '_')
+        segment_start -= 1
+      end
+      break if segment_start == segment_end
+      path_start = segment_start
+    end
+    # A leading `::` is part of the path: it says top level, on purpose.
+    path_start -= 2 if path_start >= 2 && line[path_start - 2, 2] == "::"
+
+    line[path_start...end_char]
+  end
+
+  # The declarations of *method* as reached through the receiver written
+  # before the dot - a type name, a constructor call, or a local whose type
+  # the source spells out.
+  private def receiver_method_definitions(resolver : Resolver, prefix : String, method : String, contents : String, position : LSP::Position, namespaces : Array(String)) : Array(LSP::Location)
+    token = receiver_token(prefix)
+    return [] of LSP::Location unless token
+
+    written, class_method = syntax_receiver_type(token, contents, position)
+    return [] of LSP::Location unless written
+
+    fqn = resolver.resolve(written, namespaces)
+    return [] of LSP::Location unless fqn
+
+    decl_locations(resolver.members(fqn, class_method).select(&.name.== method))
+  end
+
+  # The receiver expression ending at the dot: a constant path, a constructor
+  # call on one, or a bare local. Anything more elaborate - a chained call, an
+  # index - has a type only inference can name.
+  private def receiver_token(prefix : String) : String?
+    trimmed = prefix.rstrip
+    match = trimmed.match(/((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*\.new(?:\([^)]*\))?)\z/) ||
+            trimmed.match(/((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\z/) ||
+            trimmed.match(/([a-z_]\w*[!?]?)\z/)
+    match.try(&.[1])
+  end
+
+  # The declarations of a method called without a receiver: what the
+  # enclosing type responds to - private methods included, since a bare call
+  # is exactly how those are reached - and then what the top level defines.
+  private def bare_call_definitions(resolver : Resolver, method : String, namespaces : Array(String)) : Array(LSP::Location)
+    candidates = [] of Analysis::MethodDecl
+    unless namespaces.empty?
+      fqn = namespaces.join("::")
+      candidates.concat(resolver.members(fqn, false, include_private: true))
+      candidates.concat(resolver.members(fqn, true, include_private: true))
+    end
+    candidates.concat(resolver.members("", false, include_private: true))
+
+    decl_locations(candidates.select(&.name.== method))
+  end
+
+  # Declarations as LSP locations, dropping any the index has no file for.
+  private def decl_locations(decls) : Array(LSP::Location)
+    decls.compact_map do |decl|
+      decl.file.try { |file| LSP::Location.new(uri: Utils.file_uri(file), range: decl.range) }
+    end
+  end
+
+  def references(server : LSP::Server, params : LSP::ReferenceParams, *, wait_budget : Time::Span? = nil)
     file_uri = URI.parse(params.text_document.uri)
-    result = self.compile(server, file_uri, in_memory: true, wants_doc: true)
+    result = self.compile(server, file_uri, in_memory: true, wants_doc: true, wait_budget: wait_budget)
     location = Crystal::Location.new(
       file_uri.decoded_path,
       line_number: params.position.line + 1,
@@ -567,7 +717,11 @@ class Crystalline::Workspace
       context: LSP::ReferenceContext.new(include_declaration: true),
     )
 
-    references(server, reference_params).try do |locations|
+    # Budgeted like hover: highlights fire whenever the cursor rests, and an
+    # answer that queued behind a full build lights up an identifier the user
+    # stopped caring about. A rename keeps its unbounded wait - it was asked
+    # for explicitly, and answering wrongly-nothing would cancel the rename.
+    references(server, reference_params, wait_budget: INTERACTIVE_COMPILE_BUDGET).try do |locations|
       locations.compact_map do |location|
         next unless location.uri == params.text_document.uri
         LSP::DocumentHighlight.new(
@@ -843,7 +997,7 @@ class Crystalline::Workspace
     # answering a keystroke that stopped being interesting many keystrokes ago.
     # Give up instead, and say the answer is incomplete so the client asks again
     # as typing continues - by which time there is an analysis to answer from.
-    if !result && !@@compilation_lock.wait_until_available(COMPLETION_COMPILE_BUDGET)
+    if !result && !@@compilation_lock.wait_until_available(INTERACTIVE_COMPILE_BUDGET)
       LSP::Log.debug { "Gave up waiting to compile a completion of #{file_uri}" }
       return LSP::CompletionList.new(is_incomplete: true, items: [] of LSP::CompletionItem)
     end

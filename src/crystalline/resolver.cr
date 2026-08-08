@@ -15,9 +15,11 @@ require "./index"
 class Crystalline::Resolver
   alias TypeDecl = Analysis::TypeDecl
   alias MethodDecl = Analysis::MethodDecl
+  alias ConstDecl = Analysis::ConstDecl
 
   @types = Hash(String, Array(TypeDecl)).new
   @methods = Hash(String, Array(MethodDecl)).new
+  @constants = Hash(String, Array(ConstDecl)).new
 
   # Crystal types are open, so the declarations of one type are gathered from
   # wherever they were written rather than expected in one place.
@@ -28,6 +30,9 @@ class Crystalline::Resolver
       end
       entry.declarations.methods.each do |decl|
         (@methods[decl.owner] ||= [] of MethodDecl) << decl
+      end
+      entry.declarations.constants.each do |decl|
+        (@constants[decl.fqn] ||= [] of ConstDecl) << decl
       end
     end
   end
@@ -66,12 +71,48 @@ class Crystalline::Resolver
     end
   end
 
+  # Everywhere the type *fqn* is declared - its reopenings included, since an
+  # open type has as many declaration sites as there are places that add to it.
+  def type_declarations(fqn : String) : Array(TypeDecl)
+    declarations_of(fqn)
+  end
+
+  # The declarations of the constant that *path* refers to when written in
+  # *scope*, looked up outward the way `resolve` looks a type up. An enum
+  # member is a constant on the enum, so `Color::Red` is answered here too.
+  def constant_declarations(path : String, scope : Array(String) = [] of String) : Array(ConstDecl)
+    names = segments(path)
+    return [] of ConstDecl if names.empty?
+
+    if path.lstrip.starts_with?("::")
+      return @constants[names.join("::")]? || [] of ConstDecl
+    end
+
+    scope.size.downto(0) do |depth|
+      container = scope[0...depth]
+      if (found = @constants[(container + names).join("::")]?)
+        return found
+      end
+
+      next if container.empty?
+      ancestors(container.join("::")).each do |ancestor|
+        if (found = @constants["#{ancestor}::#{names.join("::")}"]?)
+          return found
+        end
+      end
+    end
+
+    [] of ConstDecl
+  end
+
   # Every method *fqn* responds to, its ancestors included, most derived first.
-  def members(fqn : String, class_method : Bool) : Array(MethodDecl)
+  def members(fqn : String, class_method : Bool, *, include_private : Bool = false) : Array(MethodDecl)
     found = class_method ? class_members(fqn) : instance_members(fqn)
-    # A private method is not reachable through a receiver, which is the only
-    # way this is ever asked.
-    found.reject(&.visibility.private?).uniq { |method| {method.name, method.detail} }
+    # A private method is not reachable through a receiver, so completion never
+    # wants one - but a bare call from inside the type is exactly how a private
+    # method is reached, and a definition lookup does.
+    found.reject!(&.visibility.private?) unless include_private
+    found.uniq { |method| {method.name, method.detail} }
   end
 
   # Every type *fqn* inherits from, most derived first.
@@ -142,13 +183,13 @@ class Crystalline::Resolver
 
     initializers = instance_members(fqn).select(&.name.== "initialize")
     if initializers.empty?
-      [new_from(fqn, [] of Analysis::ParamDecl, nil, decls.first.range)]
+      [new_from(fqn, [] of Analysis::ParamDecl, nil, decls.first.range, decls.first.file)]
     else
-      initializers.map { |init| new_from(fqn, init.params, init.doc, init.range) }
+      initializers.map { |init| new_from(fqn, init.params, init.doc, init.range, init.file) }
     end
   end
 
-  private def new_from(fqn : String, params : Array(Analysis::ParamDecl), doc : String?, range : LSP::Range) : MethodDecl
+  private def new_from(fqn : String, params : Array(Analysis::ParamDecl), doc : String?, range : LSP::Range, file : String?) : MethodDecl
     MethodDecl.new(
       owner: fqn,
       name: "new",
@@ -159,6 +200,7 @@ class Crystalline::Resolver
       doc: doc,
       detail: params.empty? ? "new" : "new(#{params.join(", ")})",
       range: range,
+      file: file,
     )
   end
 
