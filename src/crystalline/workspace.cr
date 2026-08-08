@@ -1,19 +1,15 @@
 require "uri"
 require "yaml"
 require "./text_document"
+require "./compilation_lock"
+require "./index"
+require "./resolver"
 require "./progress"
 require "./project"
 require "./result_cache"
 require "./analysis/*"
 
 class Crystalline::Workspace
-  # A file parsed once and reused until its contents change.
-  record SourceIndexEntry,
-    stamp : String,
-    methods : Array(Analysis::SourceMethod),
-    types : Array({String, LSP::CompletionItemKind}),
-    symbols : Array(LSP::DocumentSymbol)
-
   # A successful analysis, and the target it was produced from.
   record StoredAnalysis,
     target : String,
@@ -40,15 +36,10 @@ class Crystalline::Workspace
   # was compiled last - a partial view that is still worth asking.
   @analyses = {} of String => StoredAnalysis
   @analyses_lock = Mutex.new
-  # Syntax-only completion answers are built by parsing the whole project. Keep
-  # the parse of every file around, keyed by a stamp of its contents, so typing
-  # does not re-read and re-parse the project on every keystroke.
-  @source_index = {} of String => SourceIndexEntry
   # Requests are served from independent fibers, which run in parallel when the
   # server is built with `-Dpreview_mt`. Each piece of mutable state below is
   # only touched while holding its lock.
   @completion_cache_lock = Mutex.new
-  @source_index_lock = Mutex.new
   @documents_lock = Mutex.new
   @dependency_attempts_lock = Mutex.new
   # The workspace filesystem uri.
@@ -57,6 +48,9 @@ class Crystalline::Workspace
   getter opened_documents = {} of String => TextDocument
   # A list of projects in this workspace
   getter projects = [] of Project
+  # What the workspace knows from parsing alone, which is everything it can
+  # answer without waiting for the compiler.
+  getter index : Index
 
   def initialize(server : LSP::Server, root_uri : String?)
     if (@root_uri = root_uri.try &->URI.parse(String))
@@ -70,6 +64,7 @@ class Crystalline::Workspace
         }
       end
     end
+    @index = Index.new(@projects)
   end
 
   # The document opened at *uri*, if any.
@@ -242,7 +237,13 @@ class Crystalline::Workspace
   end
 
   # Allow one compilation at a time.
-  class_getter compilation_lock = Mutex.new
+  class_getter compilation_lock = CompilationLock.new
+
+  # How long a completion will wait for the compiler to become free before
+  # answering without it. This is a budget for what a person will sit through
+  # watching for a popup, so it does not scale with the size of the project -
+  # the whole point is that a big project cannot spend the seconds it needs.
+  COMPLETION_COMPILE_BUDGET = 1.second
 
   # Use the crystal compiler to typecheck the program.
   def compile(
@@ -707,7 +708,11 @@ class Crystalline::Workspace
         return analysis_result unless analysis_result.items.empty?
       end
       if syntax_items && !syntax_items.empty?
-        return finalize_completion(syntax_items, completion_context, position.line)
+        # Only what the buffer spells out, with nothing a type inherits or
+        # generates, because no analysis was there to be asked. Incomplete, so
+        # the client keeps asking as typing continues and takes the full answer
+        # as soon as one exists.
+        return finalize_completion(syntax_items, completion_context, position.line, incomplete: true)
       end
     end
 
@@ -757,6 +762,17 @@ class Crystalline::Workspace
     result = cached.try(&.[0])
     location = cached.try(&.[1]) || location
     analyzed_receiver_expression = false
+
+    # Everything past this point runs the compiler, and only one analysis runs
+    # at a time. A compilation that is nearly over is worth waiting out, but the
+    # project-wide analysis at startup is not: answering once it finishes means
+    # answering a keystroke that stopped being interesting many keystrokes ago.
+    # Give up instead, and say the answer is incomplete so the client asks again
+    # as typing continues - by which time there is an analysis to answer from.
+    if !result && !@@compilation_lock.wait_until_available(COMPLETION_COMPILE_BUDGET)
+      LSP::Log.debug { "Gave up waiting to compile a completion of #{file_uri}" }
+      return LSP::CompletionList.new(is_incomplete: true, items: [] of LSP::CompletionItem)
+    end
 
     if !result && receiver_expression
       fast_result = fast_receiver_compile(server, file_uri, receiver_expression)
@@ -976,7 +992,7 @@ class Crystalline::Workspace
     "#{context.trigger_character}\0#{lines.join}"
   end
 
-  private def finalize_completion(source_items : Array(LSP::CompletionItem), context : CompletionContext, line : Int32) : LSP::CompletionList
+  private def finalize_completion(source_items : Array(LSP::CompletionItem), context : CompletionContext, line : Int32, *, incomplete = false) : LSP::CompletionList
     range = context.completion_range(line)
     completion_items = source_items.map do |source_item|
       item = source_item
@@ -1008,7 +1024,7 @@ class Crystalline::Workspace
       completion_items[selected_element_index] = selected_element
     end
 
-    LSP::CompletionList.new(is_incomplete: false, items: completion_items)
+    LSP::CompletionList.new(is_incomplete: incomplete, items: completion_items)
   end
 
   # The standalone expression that stands in for the receiver at *position*,
@@ -1346,7 +1362,7 @@ class Crystalline::Workspace
     path = Path[file_uri.decoded_path].normalize.to_s
     # The same stamp the syntax index uses for a rewritten buffer, so the two
     # share one parse of it rather than each paying for their own.
-    symbols = index_entry(path, contents, stamp: "current:#{contents.hash}").symbols
+    symbols = @index.entry_for(path, contents, stamp: Index.rewritten_stamp(contents)).symbols
     names = [] of String
 
     while (symbol = symbols.find { |candidate|
@@ -1372,140 +1388,80 @@ class Crystalline::Workspace
   end
 
   private def syntax_method_items(file_uri : URI, contents : String, position : LSP::Position, context : CompletionContext) : Array(LSP::CompletionItem)?
-    receiver = context.analysis_prefix.strip
-    owner = nil
-    class_method = false
+    written, class_method = syntax_receiver_type(context.analysis_prefix.strip, contents, position)
+    return unless written
 
-    if receiver.matches?(/\A[A-Z]\w*(?:::[A-Z]\w*)*\z/)
-      owner = receiver
-      class_method = true
-    elsif match = receiver.match(/([A-Z]\w*(?:::[A-Z]\w*)*)\.new(?:\(.*\))?$/)
-      owner = match[1]
-    elsif receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
-      lines_before_cursor = contents.lines[0...position.line]
-      lines_before_cursor.reverse_each do |line|
-        if match = line.match(/^\s*#{Regex.escape(receiver)}\s*:\s*([A-Z]\w*(?:::[A-Z]\w*)*)/)
-          owner = match[1]
-          break
-        elsif match = line.match(/^\s*#{Regex.escape(receiver)}\s*=\s*([A-Z]\w*(?:::[A-Z]\w*)*)\.new\b/)
-          owner = match[1]
-          break
-        end
-      end
-
-      unless owner
-        prefix = lines_before_cursor.join("\n")
-        matches = prefix.scan(/\b#{Regex.escape(receiver)}\s*:\s*([A-Z]\w*(?:::[A-Z]\w*)*)/)
-        owner = matches.last?.try(&.[1])
-      end
-    end
-    return unless owner
-
+    # The buffer is mid-edit, so the receiver line is replaced by one that
+    # parses before anything is asked of it.
     parse_lines = contents.lines(chomp: false)
     parse_lines[position.line] = context.rewritten_line
-    items = source_methods(file_uri, parse_lines.join).compact_map do |method|
-      next unless method.owner == owner && method.class_method == class_method
+    repaired = parse_lines.join
+
+    resolver = Resolver.new(@index.project_entries(file_uri, buffer_sources, current_source: repaired))
+    # `Inner.` inside `module Outer` means `Outer::Inner`, and the receiver as
+    # written says nothing about which one that is.
+    fqn = resolver.resolve(written, enclosing_namespaces(file_uri, repaired, position))
+    return unless fqn
+
+    range = context.completion_range(position.line)
+    resolver.members(fqn, class_method).map do |method|
       LSP::CompletionItem.new(
         label: method.detail,
         insert_text: method.name,
         filter_text: method.name,
         kind: LSP::CompletionItemKind::Method,
-        text_edit: LSP::TextEdit.new(
-          range: context.completion_range(position.line),
-          new_text: method.name,
-        ),
+        documentation: method.doc.try { |doc| LSP::MarkupContent.new(kind: LSP::MarkupKind::MarkDown, value: doc) },
+        text_edit: LSP::TextEdit.new(range: range, new_text: method.name),
       )
     end
+  end
 
-    items
+  # The type a receiver names, as written, and whether it was named as a type
+  # rather than as a value of one.
+  private def syntax_receiver_type(receiver : String, contents : String, position : LSP::Position) : {String?, Bool}
+    if receiver.matches?(/\A(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*\z/)
+      return {receiver, true}
+    end
+
+    if match = receiver.match(/((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\.new(?:\(.*\))?$/)
+      return {match[1], false}
+    end
+
+    return {nil, false} unless receiver.matches?(/\A[a-z_]\w*[!?]?\z/)
+
+    lines_before_cursor = contents.lines[0...position.line]
+    lines_before_cursor.reverse_each do |line|
+      if match = line.match(/^\s*#{Regex.escape(receiver)}\s*:\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)/)
+        return {match[1], false}
+      elsif match = line.match(/^\s*#{Regex.escape(receiver)}\s*=\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\.new\b/)
+        return {match[1], false}
+      end
+    end
+
+    prefix = lines_before_cursor.join("\n")
+    matches = prefix.scan(/\b#{Regex.escape(receiver)}\s*:\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)/)
+    {matches.last?.try(&.[1]), false}
   end
 
   private def source_methods(file_uri : URI, current_source : String) : Array(Analysis::SourceMethod)
-    project_sources(file_uri, current_source: current_source).flat_map(&.methods)
+    @index.project_entries(file_uri, buffer_sources, current_source: current_source).flat_map(&.methods)
   end
 
-  # The crystal files belonging to the project *file_uri* is part of, falling
-  # back to the opened documents for a server started without a workspace root.
-  private def project_files(file_uri : URI, documents : Hash(String, TextDocument)) : Array(String)
-    project = Project.best_fit_for_file(@projects, file_uri)
-    files = if project
-              crystal_files_in(project)
-            else
-              documents.keys.map { |uri| URI.parse(uri).decoded_path }
-            end
-    files.uniq!
+  # Parse every file of every project once, up front, so the first request that
+  # needs the index is not the one that pays to build it.
+  def warm_syntax_index : Nil
+    @index.warm(buffer_sources)
   end
 
-  private def crystal_files_in(project : Project) : Array(String)
-    root = project.root_uri.decoded_path
-    Dir.glob(Path[root, "**", "*.cr"].to_s).reject do |path|
-      relative_parts = Path[path].relative_to(root).parts
-      relative_parts.includes?("lib") || relative_parts.includes?(".git")
-    end
-  end
-
-  # Parse every project file once and reuse that parse until its contents
-  # change. Completion is requested on every keystroke, and re-reading and
-  # re-parsing a whole project that often costs hundreds of milliseconds per
-  # character on a large codebase.
-  private def project_sources(file_uri : URI, *, current_source : String? = nil) : Array(SourceIndexEntry)
-    documents = documents_snapshot
-    buffers = document_sources_by_path(documents)
-    current_path = Path[file_uri.decoded_path].normalize.to_s
-
-    project_files(file_uri, documents).compact_map do |path|
-      normalized = Path[path].normalize.to_s
-      begin
-        if current_source && normalized == current_path
-          # Rewritten for the completion being answered, so it is never reusable.
-          index_entry(normalized, current_source, stamp: "current:#{current_source.hash}")
-        elsif (buffer = buffers[normalized]?)
-          index_entry(normalized, buffer, stamp: "buffer:#{buffer.hash}")
-        else
-          info = File.info(path)
-          stamp = "disk:#{info.modification_time.to_unix_ns}:#{info.size}"
-          cached_index_entry(normalized, stamp) || index_entry(normalized, File.read(path), stamp: stamp)
-        end
-      rescue e
-        LSP::Log.debug(exception: e) { "Unable to index #{path}" }
-        nil
-      end
-    end
-  end
-
-  private def cached_index_entry(path : String, stamp : String) : SourceIndexEntry?
-    entry = @source_index_lock.synchronize { @source_index[path]? }
-    entry if entry && entry.stamp == stamp
-  end
-
-  private def index_entry(path : String, source : String, *, stamp : String) : SourceIndexEntry
-    if (cached = cached_index_entry(path, stamp))
-      return cached
-    end
-
-    ast = begin
-      parse_source(source, path)
-    rescue
-      # Only pay for the repair pass when the source does not parse as it is.
-      parse_source(BrokenSourceFixer.fix(source), path)
-    end
-
-    methods = Analysis::SourceMethodsVisitor.new.tap { |visitor| ast.accept(visitor) }.methods
-    symbols = Analysis::DocumentSymbolsVisitor.new.tap { |visitor| ast.accept(visitor) }.symbols
-    entry = SourceIndexEntry.new(
-      stamp: stamp,
-      methods: methods,
-      types: flatten_type_symbols(symbols),
-      symbols: symbols,
-    )
-    @source_index_lock.synchronize { @source_index[path] = entry }
-    entry
+  # Whether a parse of *path* is being kept for the contents it has on disk.
+  def syntax_indexed?(path : String) : Bool
+    @index.indexed?(path)
   end
 
   # The contents of every opened document, indexed by normalized path. An opened
   # buffer supersedes what is on disk.
-  private def document_sources_by_path(documents : Hash(String, TextDocument)) : Hash(String, String)
-    documents.each_with_object({} of String => String) do |(uri, document), acc|
+  private def buffer_sources : Hash(String, String)
+    documents_snapshot.each_with_object({} of String => String) do |(uri, document), acc|
       acc[Path[URI.parse(uri).decoded_path].normalize.to_s] = document.contents
     end
   end
@@ -1531,21 +1487,7 @@ class Crystalline::Workspace
   end
 
   private def syntax_type_symbols(file_uri : URI) : Array({String, LSP::CompletionItemKind})
-    project_sources(file_uri).flat_map(&.types)
-  end
-
-  private def flatten_type_symbols(symbols : Array(LSP::DocumentSymbol), parent : String? = nil) : Array({String, LSP::CompletionItemKind})
-    symbols.flat_map do |symbol|
-      qualified_name = parent ? "#{parent}::#{symbol.name}" : symbol.name
-      kind = case symbol.kind
-             when .class?  then LSP::CompletionItemKind::Class
-             when .module? then LSP::CompletionItemKind::Module
-             when .enum?   then LSP::CompletionItemKind::Enum
-             end
-
-      entries = kind ? [{qualified_name, kind}] : [] of {String, LSP::CompletionItemKind}
-      entries.concat(flatten_type_symbols(symbol.children || [] of LSP::DocumentSymbol, qualified_name))
-    end
+    @index.project_entries(file_uri, buffer_sources).flat_map(&.types)
   end
 
   def document_symbols(server : LSP::Server, file_uri : URI)
@@ -1574,40 +1516,18 @@ class Crystalline::Workspace
 
   def workspace_symbols(params : LSP::WorkspaceSymbolParams)
     query = params.query.downcase
-    documents = documents_snapshot
-    buffers = document_sources_by_path(documents)
-    files = @projects.flat_map { |project| crystal_files_in(project) }
+    buffers = buffer_sources
 
     # A workspace-less server is still useful in editors that open individual
     # files without sending a root URI.
-    if files.empty?
-      files.concat(documents.keys.map { |uri| URI.parse(uri).decoded_path })
-    end
-
-    files.uniq!.flat_map do |path|
-      normalized = Path[path].normalize.to_s
-      uri = Utils.file_uri(normalized)
-      entry = if (buffer = buffers[normalized]?)
-                index_entry(normalized, buffer, stamp: "buffer:#{buffer.hash}")
-              else
-                info = File.info(path)
-                stamp = "disk:#{info.modification_time.to_unix_ns}:#{info.size}"
-                cached_index_entry(normalized, stamp) || index_entry(normalized, File.read(path), stamp: stamp)
-              end
-
-      entry.symbols.flat_map(&.to_symbol_information_array(uri))
+    @index.all_files(buffers.keys).flat_map do |path|
+      uri = Utils.file_uri(Path[path].normalize.to_s)
+      @index.entry_from(path, buffers).symbols.flat_map(&.to_symbol_information_array(uri))
     rescue e
       LSP::Log.debug(exception: e) { "Unable to collect symbols from #{path}: #{e.message}" }
       [] of LSP::SymbolInformation
     end.select { |symbol| query.empty? || symbol.name.downcase.includes?(query) }
       .sort_by { |symbol| {symbol.name.downcase, symbol.location.uri, symbol.location.range.start.line} }
-  end
-
-  private def parse_source(source : String, path : String) : Crystal::ASTNode
-    parser = Crystal::Parser.new(source)
-    parser.filename = path
-    parser.wants_doc = true
-    parser.parse
   end
 
   private def fix_source(source : String) : String

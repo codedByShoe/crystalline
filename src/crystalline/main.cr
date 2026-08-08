@@ -51,6 +51,7 @@ module Crystalline
 
   def self.init(*, input : IO = STDIN, output : IO = STDOUT)
     EnvironmentConfig.run
+    GC.configure_for_analysis
     {% if flag?(:debug) %}
       ::Log.setup(:debug, LSP::Log.backend.not_nil!)
     {% end %}

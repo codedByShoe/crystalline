@@ -23,6 +23,13 @@ class Crystalline::Controller
   end
 
   def when_ready : Nil
+    # Parsing the project needs no compiler, so it does not queue behind the
+    # analysis below - and it is what answers the requests that arrive while
+    # that analysis is still running.
+    spawn do
+      workspace.warm_syntax_index
+    end
+
     # Compile the workspace at once.
     spawn do
       workspace.projects.each do |p|
