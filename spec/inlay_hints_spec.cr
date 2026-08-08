@@ -57,6 +57,32 @@ describe "inlay hints" do
       drawn(source).should eq(source)
     end
 
+    it "names each target of a multiple assignment" do
+      source = <<-CRYSTAL
+      count, name = 5, "five"
+
+      CRYSTAL
+
+      drawn(source).should eq <<-CRYSTAL
+      count: Int32, name: String = 5, "five"
+
+      CRYSTAL
+    end
+
+    it "stays quiet when a multiple assignment unpacks a single value" do
+      source = <<-CRYSTAL
+      pair = {1, "one"}
+      count, name = pair
+
+      CRYSTAL
+
+      drawn(source).should eq <<-CRYSTAL
+      pair: Tuple = {1, "one"}
+      count, name = pair
+
+      CRYSTAL
+    end
+
     it "names what was constructed, qualified as it resolves" do
       source = <<-CRYSTAL
       module Outer

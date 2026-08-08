@@ -424,6 +424,12 @@ definition signature or the expanded macro.
 Fetch all the symbols in a given file, used in VSCode to populate the Outline
 view and the Breadcrumbs.
 
+#### Inlay hints
+
+Draw the type of a local and the name of the parameter an argument is passed
+as, inline. Answered from syntax alone, so hints never wait on the compiler -
+and stay quiet wherever the type is not written down in the source.
+
 ## Limitations
 
 - Memory usage is high due to the boehm GC behaviour and the crystal compiler

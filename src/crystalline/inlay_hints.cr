@@ -76,6 +76,26 @@ class Crystalline::InlayHints < Crystal::Visitor
     false
   end
 
+  def visit(node : Crystal::MultiAssign)
+    node.values.each(&.accept(self))
+
+    # `a, b = 1, "x"` assigns positionally. With a single value on the right -
+    # `a, b = pair` or `*a, b = list` - what each target gets is inference's
+    # to say, not the source's.
+    return false unless node.targets.size == node.values.size
+
+    node.targets.each_with_index do |target, index|
+      next unless target.is_a?(Crystal::Var)
+
+      type = derived_type(node.values[index])
+      next unless type
+
+      @locals[target.name] = type
+      target.end_location.try { |location| add(location.line_number - 1, location.column_number, ": #{type}", :type) }
+    end
+    false
+  end
+
   def visit(node : Crystal::Call)
     add_parameter_hints(node)
     true
