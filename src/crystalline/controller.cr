@@ -115,6 +115,12 @@ class Crystalline::Controller
         return nil unless pending?(message.id)
         workspace.rename(@server, message.params)
       end
+    when LSP::PrepareRenameRequest
+      # Answered from the buffer alone, so it must not queue behind the
+      # requests that compile: it is what the rename UI waits on to open.
+      @documents_lock.synchronize do
+        workspace.prepare_rename(message.params)
+      end
     when LSP::SignatureHelpRequest
       @compiler_lock.synchronize do
         return nil unless pending?(message.id)
@@ -151,6 +157,12 @@ class Crystalline::Controller
     when LSP::FoldingRangeRequest
       @documents_lock.synchronize do
         workspace.folding_ranges(message.params)
+      end
+    when LSP::InlayHintRequest
+      # Needs no compiler, so it does not take the lock that serializes what
+      # does: an editor asks for these on every scroll.
+      @documents_lock.synchronize do
+        workspace.inlay_hints(message.params)
       end
     when LSP::WorkspaceSymbolRequest
       @documents_lock.synchronize do

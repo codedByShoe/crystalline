@@ -18,10 +18,11 @@ module Crystalline
     definition_provider: true,
     references_provider: true,
     document_highlight_provider: true,
-    rename_provider: LSP::RenameOptions.new(prepare_provider: false),
+    rename_provider: LSP::RenameOptions.new(prepare_provider: true),
     workspace_symbol_provider: true,
     document_symbol_provider: true,
     folding_range_provider: true,
+    inlay_hint_provider: true,
     signature_help_provider: LSP::SignatureHelpOptions.new(
       trigger_characters: ["(", ","],
     ),

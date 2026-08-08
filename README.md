@@ -397,7 +397,11 @@ A whole document or a text selection.
 #### Go to definition
 
 By clicking on a symbol with the Cmd or Ctrl key pressed (editor/platform
-dependent).
+dependent). The compiler provides the precise answer; when it has none - while
+the first build of the project is still running, when the buffer does not
+compile, or inside a method no call ever reaches (which the compiler never
+types) - a parse-level index of the project and its shards answers instead, so
+jumping to a type, method, or constant declared in the project keeps working.
 
 #### Find references and document highlights
 
@@ -408,7 +412,9 @@ document.
 #### Rename
 
 Rename semantically resolved methods, types, constants, and variables across
-the entry point's dependency tree.
+the entry point's dependency tree. The rename UI opens instantly (prepare
+support is answered from syntax alone), and replacements that are not valid
+Crystal identifiers are refused before any edit is made.
 
 #### Workspace symbols
 
@@ -423,6 +429,12 @@ definition signature or the expanded macro.
 
 Fetch all the symbols in a given file, used in VSCode to populate the Outline
 view and the Breadcrumbs.
+
+#### Inlay hints
+
+Draw the type of a local and the name of the parameter an argument is passed
+as, inline. Answered from syntax alone, so hints never wait on the compiler -
+and stay quiet wherever the type is not written down in the source.
 
 ## Limitations
 

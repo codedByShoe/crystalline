@@ -103,6 +103,7 @@ module Crystalline::Analysis
         type_vars: [] of String,
         doc: node.doc,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
       false
     end
@@ -138,11 +139,12 @@ module Crystalline::Analysis
         name: node.name,
         class_method: !receiver.nil?,
         params: params_of(node),
-        return_type: node.return_type.try(&.to_s),
+        return_type: restriction_text(node.return_type),
         visibility: node.visibility.public? ? @visibility : node.visibility,
         doc: node.doc,
         detail: Utils.format_def(node, short: true),
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
       false
     end
@@ -156,7 +158,7 @@ module Crystalline::Analysis
       @ivars << IVarDecl.new(
         owner: owner,
         name: var.name,
-        restriction: node.declared_type.to_s,
+        restriction: restriction_text(node.declared_type),
         range: Utils.lsp_range_from_node(node),
       )
       false
@@ -195,6 +197,7 @@ module Crystalline::Analysis
       predicate = base.ends_with?('?')
       base = base.rchop('?')
       range = Utils.lsp_range_from_node(node)
+      file = file_of(node)
 
       node.args.each do |arg|
         name, restriction = accessor_target(arg)
@@ -203,10 +206,10 @@ module Crystalline::Analysis
         reader = predicate ? "#{name}?" : name
 
         unless base == "setter"
-          @methods << accessor(owner, reader, class_method, restriction, range)
+          @methods << accessor(owner, reader, class_method, restriction, range, file)
         end
         unless base == "getter"
-          @methods << accessor(owner, "#{name}=", class_method, nil, range,
+          @methods << accessor(owner, "#{name}=", class_method, nil, range, file,
             params: [ParamDecl.new("value", restriction, nil, false, false, false)])
         end
       end
@@ -217,7 +220,7 @@ module Crystalline::Analysis
     # Each of the four ways to write one is a different node.
     private def accessor_target(arg : Crystal::ASTNode) : {String, String?}
       case arg
-      when Crystal::TypeDeclaration then {arg.var.to_s, arg.declared_type.to_s}
+      when Crystal::TypeDeclaration then {arg.var.to_s, restriction_text(arg.declared_type)}
       when Crystal::SymbolLiteral   then {arg.value, nil}
       when Crystal::Assign          then {arg.target.to_s, nil}
       else                               {arg.to_s, nil}
@@ -227,6 +230,11 @@ module Crystalline::Analysis
     # The type currently being visited, or nil at the top level.
     private def current_type : String?
       @scope.empty? ? nil : @scope.join("::")
+    end
+
+    # The file a node was parsed from, which is where its declaration lives.
+    private def file_of(node : Crystal::ASTNode) : String?
+      node.location.try(&.original_filename)
     end
 
     private def qualify(name : String) : String
@@ -253,6 +261,7 @@ module Crystalline::Analysis
         type_vars: type_vars || [] of String,
         doc: node.doc,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
 
       @enclosing << @scope
@@ -282,10 +291,11 @@ module Crystalline::Analysis
         namespace: @scope.dup,
         value: value,
         range: Utils.lsp_range_from_node(node),
+        file: file_of(node),
       )
     end
 
-    private def accessor(owner : String, name : String, class_method : Bool, restriction : String?, range : LSP::Range, params = [] of ParamDecl) : MethodDecl
+    private def accessor(owner : String, name : String, class_method : Bool, restriction : String?, range : LSP::Range, file : String?, params = [] of ParamDecl) : MethodDecl
       MethodDecl.new(
         owner: owner,
         name: name,
@@ -296,6 +306,7 @@ module Crystalline::Analysis
         doc: nil,
         detail: params.empty? ? name : "#{name}(#{params.join(", ")})",
         range: range,
+        file: file,
       )
     end
 
@@ -303,7 +314,7 @@ module Crystalline::Analysis
       params = node.args.map_with_index do |arg, index|
         ParamDecl.new(
           name: arg.name,
-          restriction: arg.restriction.try(&.to_s),
+          restriction: restriction_text(arg.restriction),
           default_value: arg.default_value.try(&.to_s),
           splat: index == node.splat_index,
           double_splat: false,
@@ -316,10 +327,25 @@ module Crystalline::Analysis
       params
     end
 
+    # A restriction as it reads in source.
+    #
+    # `String?` parses as a union with `Nil`, and printing that back gives
+    # `String | ::Nil` - accurate, and not what anybody wrote or wants to read
+    # in the margin of their editor.
+    private def restriction_text(node : Crystal::ASTNode?) : String?
+      return unless node
+      return node.to_s unless node.is_a?(Crystal::Union) && node.types.size == 2
+
+      nil_index = node.types.index { |type| type.to_s == "::Nil" || type.to_s == "Nil" }
+      return node.to_s unless nil_index
+
+      "#{node.types[1 - nil_index]}?"
+    end
+
     private def param_from(arg : Crystal::Arg, *, double_splat = false, block = false) : ParamDecl
       ParamDecl.new(
         name: arg.name,
-        restriction: arg.restriction.try(&.to_s),
+        restriction: restriction_text(arg.restriction),
         default_value: arg.default_value.try(&.to_s),
         splat: false,
         double_splat: double_splat,

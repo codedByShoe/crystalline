@@ -41,6 +41,14 @@ describe "LSP request extensions" do
     round_trip_request(request).should be_a(LSP::RenameRequest)
   end
 
+  it "dispatches prepare rename requests" do
+    request = deserialize_request("textDocument/prepareRename", position_params)
+
+    request.should be_a(LSP::PrepareRenameRequest)
+    request.as(LSP::PrepareRenameRequest).params.position.line.should eq(2)
+    round_trip_request(request).should be_a(LSP::PrepareRenameRequest)
+  end
+
   it "dispatches folding range requests" do
     params = %({"textDocument":{"uri":"file:///fixture.cr"}})
     request = deserialize_request("textDocument/foldingRange", params)

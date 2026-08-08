@@ -17,6 +17,11 @@ module LSP
       property params : RenameParams
     end
 
+    class PrepareRenameRequest < RequestMessage(Range?)
+      @method = "textDocument/prepareRename"
+      property params : PrepareRenameParams
+    end
+
     class FoldingRangeRequest < RequestMessage(Array(FoldingRange)?)
       @method = "textDocument/foldingRange"
       property params : FoldingRangeParams
@@ -26,6 +31,55 @@ module LSP
       @method = "workspace/symbol"
       property params : WorkspaceSymbolParams
     end
+
+    class InlayHintRequest < RequestMessage(Array(InlayHint)?)
+      @method = "textDocument/inlayHint"
+      property params : InlayHintParams
+    end
+  end
+
+  # Reopened rather than vendored: the `lsp` shard predates inlay hints, and
+  # both the initializer and the JSON codec read `@type.instance_vars` from
+  # inside a method body, so they pick up what is added here.
+  struct ServerCapabilities
+    # The server provides inlay hints.
+    @[JSON::Field(key: "inlayHintProvider")]
+    property inlay_hint_provider : Bool?
+  end
+
+  struct InlayHintParams
+    include WorkDoneProgressParams
+    include Initializer
+    include JSON::Serializable
+
+    @[JSON::Field(key: "textDocument")]
+    property text_document : TextDocumentIdentifier
+
+    # The document range the client wants hints for, which is roughly what is
+    # on screen. Everything outside it is wasted work.
+    property range : Range
+  end
+
+  Enum.number InlayHintKind do
+    Type      = 1
+    Parameter = 2
+  end
+
+  struct InlayHint
+    include Initializer
+    include JSON::Serializable
+
+    property position : Position
+    property label : String
+    property kind : InlayHintKind?
+
+    @[JSON::Field(key: "paddingLeft")]
+    property padding_left : Bool?
+
+    @[JSON::Field(key: "paddingRight")]
+    property padding_right : Bool?
+
+    property tooltip : String?
   end
 
   struct ReferenceParams
@@ -75,6 +129,13 @@ module LSP
 
     @[JSON::Field(key: "newName")]
     property new_name : String
+  end
+
+  struct PrepareRenameParams
+    include TextDocumentPositionParams
+    include WorkDoneProgressParams
+    include Initializer
+    include JSON::Serializable
   end
 
   struct FoldingRangeParams
@@ -141,7 +202,9 @@ module LSP
       "textDocument/references":        ReferencesRequest,
       "textDocument/documentHighlight": DocumentHighlightRequest,
       "textDocument/rename":            RenameRequest,
+      "textDocument/prepareRename":     PrepareRenameRequest,
       "textDocument/foldingRange":      FoldingRangeRequest,
+      "textDocument/inlayHint":         InlayHintRequest,
       "workspace/symbol":               WorkspaceSymbolRequest,
     }, default: UnknownRequest
   end
