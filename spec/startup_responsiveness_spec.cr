@@ -311,14 +311,17 @@ describe "Workspace#warm_syntax_index" do
     root = File.tempname("crystalline-warm-index")
     Dir.mkdir_p(File.join(root, "src"))
     Dir.mkdir_p(File.join(root, "lib", "other", "src"))
+    Dir.mkdir_p(File.join(root, "lib", "other", "spec"))
 
     File.write(File.join(root, "shard.yml"), "name: warm\nversion: 0.1.0\n")
     main_path = File.join(root, "src", "warm.cr")
     helper_path = File.join(root, "src", "helper.cr")
-    vendored_path = File.join(root, "lib", "other", "src", "other.cr")
+    shard_path = File.join(root, "lib", "other", "src", "other.cr")
+    shard_spec_path = File.join(root, "lib", "other", "spec", "other_spec.cr")
     File.write(main_path, "class Warm\n  def go\n  end\nend\n")
     File.write(helper_path, "module Helper\nend\n")
-    File.write(vendored_path, "module Other\nend\n")
+    File.write(shard_path, "module Other\nend\n")
+    File.write(shard_spec_path, "class OtherSpecHelper\nend\n")
 
     server = Crystalline::SpecSupport.build_server
     workspace = Crystalline::Workspace.new(server, Crystalline::Utils.file_uri(root))
@@ -329,9 +332,12 @@ describe "Workspace#warm_syntax_index" do
 
     workspace.syntax_indexed?(main_path).should be_true
     workspace.syntax_indexed?(helper_path).should be_true
-    # Shards are not project source: they are what the compiler analyzes, and
-    # indexing them would mean parsing every dependency of every project.
-    workspace.syntax_indexed?(vendored_path).should be_false
+    # Inheritance does not stop at the edge of the project, so neither does the
+    # index: what a shard declares is part of what a project type responds to.
+    workspace.syntax_indexed?(shard_path).should be_true
+    # Only each shard's `src` though. What its own specs declare is nobody's
+    # business to offer as a completion.
+    workspace.syntax_indexed?(shard_spec_path).should be_false
   ensure
     FileUtils.rm_r(root) if root && Dir.exists?(root)
   end

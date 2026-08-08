@@ -19,6 +19,9 @@ class Crystalline::Index
     declarations : Analysis::Declarations
 
   @entries = {} of String => Entry
+  # The shard sources of each project, by project root. Enumerating them means
+  # globbing a directory tree, and every completion asks.
+  @shard_files = {} of String => Array(String)
   # Entries are read and written from the fibers serving requests, and from the
   # one that builds the index at startup.
   @lock = Mutex.new
@@ -85,9 +88,8 @@ class Crystalline::Index
     entry
   end
 
-  # The crystal files of *project*. Shards are not project source: they are what
-  # the compiler analyzes, and indexing them would mean parsing every dependency
-  # of every project.
+  # The crystal files *project* owns, which is everything under it that is not
+  # a shard it depends on.
   def files_in(project : Project) : Array(String)
     root = project.root_uri.decoded_path
     Dir.glob(Path[root, "**", "*.cr"].to_s).reject do |path|
@@ -96,12 +98,22 @@ class Crystalline::Index
     end
   end
 
-  # The crystal files belonging to the project *file_uri* is part of, falling
-  # back to *opened_paths* for a server started without a workspace root.
-  def project_files(file_uri : URI, opened_paths : Array(String)) : Array(String)
-    project = Project.best_fit_for_file(@projects, file_uri)
-    files = project ? files_in(project) : opened_paths
-    files.uniq!
+  # The crystal files of the shards *project* depends on.
+  #
+  # Inheritance does not stop at the edge of a project: a type descending from
+  # `Kemal::Handler` responds to what Kemal gave it, and a tier that read only
+  # project source could not say so. Only each shard's `src` is read - the
+  # specs and samples beside it declare types that are nobody's business to
+  # offer as completions.
+  #
+  # Memoized, and deliberately not watched. Shards change when `shards install`
+  # is run, which is not something that happens while a file is being typed in;
+  # picking that up is what restarting the server is for.
+  def shard_files_in(project : Project) : Array(String)
+    key = project.root_uri.to_s
+    @lock.synchronize do
+      @shard_files[key] ||= Dir.glob(Path[project.default_lib_path, "*", "src", "**", "*.cr"].to_s)
+    end
   end
 
   # Every crystal file of every project, falling back to *opened_paths* for a
@@ -119,8 +131,10 @@ class Crystalline::Index
   # how a request asks about a buffer it has rewritten.
   def project_entries(file_uri : URI, buffers : Hash(String, String), *, current_source : String? = nil) : Array(Entry)
     current_path = Path[file_uri.decoded_path].normalize.to_s
+    project = Project.best_fit_for_file(@projects, file_uri)
+    own = project ? files_in(project) : buffers.keys.uniq
 
-    project_files(file_uri, buffers.keys).compact_map do |path|
+    entries = own.compact_map do |path|
       normalized = Path[path].normalize.to_s
       begin
         if current_source && normalized == current_path
@@ -133,6 +147,31 @@ class Crystalline::Index
         nil
       end
     end
+
+    return entries unless project
+
+    entries.concat(shard_entries(project))
+  end
+
+  # Shard files are read once and then reused without asking the filesystem
+  # whether they have changed, because within one session they have not. Every
+  # completion walks this list, and a few hundred `stat` calls per keystroke is
+  # a real cost to pay for an answer that is always the same.
+  private def shard_entries(project : Project) : Array(Entry)
+    shard_files_in(project).compact_map do |path|
+      normalized = Path[path].normalize.to_s
+      kept(normalized) || begin
+        entry_for(normalized, File.read(path), stamp: Index.disk_stamp(path))
+      rescue e
+        LSP::Log.debug(exception: e) { "Unable to index #{path}" }
+        nil
+      end
+    end
+  end
+
+  # Whatever parse is being kept for *path*, current or not.
+  private def kept(path : String) : Entry?
+    @lock.synchronize { @entries[path]? }
   end
 
   # Parse every file of every project once, up front.
@@ -143,7 +182,7 @@ class Crystalline::Index
   # compiler, so it runs while the first analysis still holds one.
   def warm(buffers : Hash(String, String)) : Nil
     @projects.each do |project|
-      files_in(project).each do |path|
+      (files_in(project) + shard_files_in(project)).each do |path|
         normalized = Path[path].normalize.to_s
         # An opened buffer is reindexed whenever it changes anyway, and there
         # are few enough of them for that to cost nothing.

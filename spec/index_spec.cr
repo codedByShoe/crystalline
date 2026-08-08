@@ -81,16 +81,53 @@ describe Crystalline::Index do
     end
   end
 
-  it "leaves shards to the compiler" do
+  it "lists only project source as the workspace's own symbols" do
     with_project do |root|
       File.write(File.join(root, "src", "own.cr"), "class Own\nend\n")
       File.write(File.join(root, "lib", "dep", "src", "dep.cr"), "class Dep\nend\n")
       index = index_for(root)
 
+      # A symbol search is asking what *this* workspace contains. Answering it
+      # with every type in every dependency would bury that.
       files = index.all_files([] of String).map { |path| File.basename(path) }
 
       files.should contain("own.cr")
       files.should_not contain("dep.cr")
+    end
+  end
+
+  it "reads shard source when resolving a name" do
+    with_project do |root|
+      own = File.join(root, "src", "own.cr")
+      File.write(own, "class Own\nend\n")
+      File.write(File.join(root, "lib", "dep", "src", "dep.cr"), "class Dep\nend\n")
+      index = index_for(root)
+
+      # The other half of the same boundary: what a name means, and what a type
+      # inherits, both run through the shards a project depends on.
+      entries = index.project_entries(URI.parse(Crystalline::Utils.file_uri(own)), {} of String => String)
+
+      type_names(entries).should contain("Own")
+      type_names(entries).should contain("Dep")
+    end
+  end
+
+  it "reuses a shard parse rather than restamping it on every request" do
+    with_project do |root|
+      own = File.join(root, "src", "own.cr")
+      shard = File.join(root, "lib", "dep", "src", "dep.cr")
+      File.write(own, "class Own\nend\n")
+      File.write(shard, "class Dep\nend\n")
+      index = index_for(root)
+      uri = URI.parse(Crystalline::Utils.file_uri(own))
+
+      index.project_entries(uri, {} of String => String)
+      # Shards do not change while a session is open, so a later request must
+      # not go back to the filesystem for them - a few hundred `stat` calls per
+      # keystroke is the cost this avoids. Deleting one proves it never looked.
+      File.delete(shard)
+
+      type_names(index.project_entries(uri, {} of String => String)).should contain("Dep")
     end
   end
 
