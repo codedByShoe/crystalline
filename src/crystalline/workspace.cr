@@ -4,6 +4,7 @@ require "./text_document"
 require "./compilation_lock"
 require "./index"
 require "./resolver"
+require "./inlay_hints"
 require "./progress"
 require "./project"
 require "./result_cache"
@@ -1500,6 +1501,26 @@ class Crystalline::Workspace
         parser.parse.accept(visitor)
       }.symbols
     }
+  end
+
+  # The types and parameter names an editor draws inline.
+  #
+  # Answered from the index, so it costs a parse of one buffer and a walk of it
+  # - no compiler, and no waiting for one. A client asks for these on every
+  # scroll and every edit, which rules out anything slower.
+  def inlay_hints(params : LSP::InlayHintParams) : Array(LSP::InlayHint)?
+    file_uri = URI.parse(params.text_document.uri)
+    document = document_at(params.text_document.uri)
+    return unless document
+
+    contents = document.contents
+    ast = Crystal::Parser.new(fix_source(contents)).tap(&.filename=(file_uri.decoded_path)).parse
+    resolver = Resolver.new(@index.project_entries(file_uri, buffer_sources, current_source: contents))
+
+    InlayHints.new(resolver, params.range).tap { |visitor| ast.accept(visitor) }.hints
+  rescue e
+    LSP::Log.debug(exception: e) { "Unable to produce inlay hints for #{params.text_document.uri}" }
+    nil
   end
 
   def folding_ranges(params : LSP::FoldingRangeParams)

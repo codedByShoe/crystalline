@@ -22,6 +22,7 @@ module Crystalline
     workspace_symbol_provider: true,
     document_symbol_provider: true,
     folding_range_provider: true,
+    inlay_hint_provider: true,
     signature_help_provider: LSP::SignatureHelpOptions.new(
       trigger_characters: ["(", ","],
     ),

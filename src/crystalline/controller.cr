@@ -152,6 +152,12 @@ class Crystalline::Controller
       @documents_lock.synchronize do
         workspace.folding_ranges(message.params)
       end
+    when LSP::InlayHintRequest
+      # Needs no compiler, so it does not take the lock that serializes what
+      # does: an editor asks for these on every scroll.
+      @documents_lock.synchronize do
+        workspace.inlay_hints(message.params)
+      end
     when LSP::WorkspaceSymbolRequest
       @documents_lock.synchronize do
         workspace.workspace_symbols(message.params)

@@ -138,7 +138,7 @@ module Crystalline::Analysis
         name: node.name,
         class_method: !receiver.nil?,
         params: params_of(node),
-        return_type: node.return_type.try(&.to_s),
+        return_type: restriction_text(node.return_type),
         visibility: node.visibility.public? ? @visibility : node.visibility,
         doc: node.doc,
         detail: Utils.format_def(node, short: true),
@@ -156,7 +156,7 @@ module Crystalline::Analysis
       @ivars << IVarDecl.new(
         owner: owner,
         name: var.name,
-        restriction: node.declared_type.to_s,
+        restriction: restriction_text(node.declared_type),
         range: Utils.lsp_range_from_node(node),
       )
       false
@@ -217,7 +217,7 @@ module Crystalline::Analysis
     # Each of the four ways to write one is a different node.
     private def accessor_target(arg : Crystal::ASTNode) : {String, String?}
       case arg
-      when Crystal::TypeDeclaration then {arg.var.to_s, arg.declared_type.to_s}
+      when Crystal::TypeDeclaration then {arg.var.to_s, restriction_text(arg.declared_type)}
       when Crystal::SymbolLiteral   then {arg.value, nil}
       when Crystal::Assign          then {arg.target.to_s, nil}
       else                               {arg.to_s, nil}
@@ -303,7 +303,7 @@ module Crystalline::Analysis
       params = node.args.map_with_index do |arg, index|
         ParamDecl.new(
           name: arg.name,
-          restriction: arg.restriction.try(&.to_s),
+          restriction: restriction_text(arg.restriction),
           default_value: arg.default_value.try(&.to_s),
           splat: index == node.splat_index,
           double_splat: false,
@@ -316,10 +316,25 @@ module Crystalline::Analysis
       params
     end
 
+    # A restriction as it reads in source.
+    #
+    # `String?` parses as a union with `Nil`, and printing that back gives
+    # `String | ::Nil` - accurate, and not what anybody wrote or wants to read
+    # in the margin of their editor.
+    private def restriction_text(node : Crystal::ASTNode?) : String?
+      return unless node
+      return node.to_s unless node.is_a?(Crystal::Union) && node.types.size == 2
+
+      nil_index = node.types.index { |type| type.to_s == "::Nil" || type.to_s == "Nil" }
+      return node.to_s unless nil_index
+
+      "#{node.types[1 - nil_index]}?"
+    end
+
     private def param_from(arg : Crystal::Arg, *, double_splat = false, block = false) : ParamDecl
       ParamDecl.new(
         name: arg.name,
-        restriction: arg.restriction.try(&.to_s),
+        restriction: restriction_text(arg.restriction),
         default_value: arg.default_value.try(&.to_s),
         splat: false,
         double_splat: double_splat,
