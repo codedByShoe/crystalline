@@ -76,8 +76,60 @@ describe "Workspace#rename" do
     rename_at(source, 0, 8, "renamed").should be_nil
   end
 
-  it "advertises rename without requiring prepare support" do
+  it "rejects a replacement that is not an identifier" do
+    source = "value = 1\n"
+    rename_at(source, 0, 2, "two words").should be_nil
+    rename_at(source, 0, 2, "Bad::Path").should be_nil
+    rename_at(source, 0, 2, "1starts_with_digit").should be_nil
+    rename_at(source, 0, 2, "def").should be_nil
+  end
+
+  it "advertises prepare support" do
     options = Crystalline::SERVER_CAPABILITIES.rename_provider.as(LSP::RenameOptions)
-    options.prepare_provider.should be_false
+    options.prepare_provider.should be_true
+  end
+end
+
+private def prepare_rename_at(source : String, line : Int32, character : Int32) : LSP::Range?
+  workspace, _server, uri = Crystalline::SpecSupport.open_document(source)
+  workspace.prepare_rename(LSP::PrepareRenameParams.new(
+    text_document: LSP::TextDocumentIdentifier.new(uri: uri.to_s),
+    position: LSP::Position.new(line: line, character: character),
+  ))
+end
+
+describe "Workspace#prepare_rename" do
+  it "returns the range of the identifier under the cursor" do
+    range = prepare_rename_at("value = 1\n", 0, 2).not_nil!
+    {range.start.character, range.end.character}.should eq({0, 5})
+  end
+
+  it "spans the whole symbol from any cursor position inside it, sigils and suffixes included" do
+    source = <<-CRYSTAL
+    @counter = 1
+    list.empty?
+    CRYSTAL
+
+    range = prepare_rename_at(source, 0, 0).not_nil!
+    {range.start.character, range.end.character}.should eq({0, 8})
+
+    range = prepare_rename_at(source, 1, 7).not_nil!
+    {range.start.character, range.end.character}.should eq({5, 11})
+  end
+
+  it "refuses whitespace, operators, and keywords" do
+    source = <<-CRYSTAL
+    def render
+    end
+    x != 2
+    CRYSTAL
+
+    prepare_rename_at(source, 0, 1).should be_nil # `def` is a keyword
+    prepare_rename_at(source, 2, 2).should be_nil # the `!=` operator
+  end
+
+  it "does not read the `!` of `!=` as a method suffix" do
+    range = prepare_rename_at("x != 2\n", 0, 0).not_nil!
+    {range.start.character, range.end.character}.should eq({0, 1})
   end
 end

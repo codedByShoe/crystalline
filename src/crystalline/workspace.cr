@@ -577,8 +577,80 @@ class Crystalline::Workspace
     end
   end
 
+  # What a rename may produce: a local or method name with an optional sigil or
+  # suffix, or a constant. Anything else - spaces, operators, a dotted path -
+  # would be written verbatim into every reference site.
+  RENAME_NEW_NAME_PATTERN = /\A@{0,2}[A-Za-z_]\w*[?!=]?\z/
+
+  # Words the lexer will never read as an identifier, so a rename to or from
+  # one can only produce code that does not parse.
+  CRYSTAL_KEYWORDS = Set{
+    "abstract", "alias", "annotation", "as", "asm", "begin", "break", "case",
+    "class", "def", "do", "else", "elsif", "end", "ensure", "enum", "extend",
+    "false", "for", "fun", "if", "in", "include", "instance_sizeof", "is_a?",
+    "lib", "macro", "module", "next", "nil", "of", "offsetof", "out",
+    "pointerof", "private", "protected", "require", "rescue", "responds_to?",
+    "return", "select", "self", "sizeof", "struct", "super", "then", "true",
+    "type", "typeof", "uninitialized", "union", "unless", "until", "when",
+    "while", "with", "yield",
+  }
+
+  # The range a rename at *position* would replace, or nothing when the cursor
+  # is not on something renameable. Answered from the buffer alone so the
+  # rename UI opens instantly: the reference search that a rename actually
+  # needs runs when the new name is submitted.
+  def prepare_rename(params : LSP::PrepareRenameParams) : LSP::Range?
+    document = document_at(params.text_document.uri)
+    return unless document
+
+    line = document.contents.lines(chomp: false)[params.position.line]?
+    return unless line
+
+    bounds = rename_symbol_bounds(line, params.position.character)
+    return unless bounds
+
+    start_char, end_char = bounds
+    symbol = line[start_char...end_char]
+    return unless symbol.matches?(RENAME_NEW_NAME_PATTERN)
+    return if CRYSTAL_KEYWORDS.includes?(symbol)
+
+    LSP::Range.new(
+      start: LSP::Position.new(line: params.position.line, character: start_char),
+      end: LSP::Position.new(line: params.position.line, character: end_char),
+    )
+  end
+
+  # The bounds of the identifier under *cursor*, sigils included.
+  private def rename_symbol_bounds(line : String, cursor : Int32) : {Int32, Int32}?
+    ident = ->(char : Char) { char.ascii_alphanumeric? || char == '_' }
+
+    # A cursor on the sigil of `@name` is on the symbol too.
+    while line[cursor]? == '@'
+      cursor += 1
+    end
+
+    start_char = cursor
+    while start_char > 0 && ident.call(line[start_char - 1])
+      start_char -= 1
+    end
+    while start_char > 0 && line[start_char - 1] == '@'
+      start_char -= 1
+    end
+
+    end_char = cursor
+    while (char = line[end_char]?) && ident.call(char)
+      end_char += 1
+    end
+    # `?` and `!` end a method name - unless an `=` follows, where they were
+    # an operator (`x != 2`) rather than part of the name.
+    end_char += 1 if line[end_char]?.in?('?', '!') && line[end_char + 1]? != '='
+
+    {start_char, end_char} unless start_char == end_char
+  end
+
   def rename(server : LSP::Server, params : LSP::RenameParams)
-    return nil if params.new_name.empty?
+    return nil unless params.new_name.matches?(RENAME_NEW_NAME_PATTERN)
+    return nil if CRYSTAL_KEYWORDS.includes?(params.new_name)
 
     reference_params = LSP::ReferenceParams.new(
       text_document: params.text_document,

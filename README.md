@@ -408,7 +408,9 @@ document.
 #### Rename
 
 Rename semantically resolved methods, types, constants, and variables across
-the entry point's dependency tree.
+the entry point's dependency tree. The rename UI opens instantly (prepare
+support is answered from syntax alone), and replacements that are not valid
+Crystal identifiers are refused before any edit is made.
 
 #### Workspace symbols
 

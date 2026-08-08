@@ -17,6 +17,11 @@ module LSP
       property params : RenameParams
     end
 
+    class PrepareRenameRequest < RequestMessage(Range?)
+      @method = "textDocument/prepareRename"
+      property params : PrepareRenameParams
+    end
+
     class FoldingRangeRequest < RequestMessage(Array(FoldingRange)?)
       @method = "textDocument/foldingRange"
       property params : FoldingRangeParams
@@ -126,6 +131,13 @@ module LSP
     property new_name : String
   end
 
+  struct PrepareRenameParams
+    include TextDocumentPositionParams
+    include WorkDoneProgressParams
+    include Initializer
+    include JSON::Serializable
+  end
+
   struct FoldingRangeParams
     include WorkDoneProgressParams
     include PartialResultParams
@@ -190,6 +202,7 @@ module LSP
       "textDocument/references":        ReferencesRequest,
       "textDocument/documentHighlight": DocumentHighlightRequest,
       "textDocument/rename":            RenameRequest,
+      "textDocument/prepareRename":     PrepareRenameRequest,
       "textDocument/foldingRange":      FoldingRangeRequest,
       "textDocument/inlayHint":         InlayHintRequest,
       "workspace/symbol":               WorkspaceSymbolRequest,
